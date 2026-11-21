@@ -367,6 +367,74 @@ fn populate(c: &Chunk) {
     let _ = c;
 }
 
+/// Person key -> local person id (sessions phase). Open addressing, grows at half full.
+struct PidTable {
+    mask: usize,
+    slots: Vec<(Key, u32)>,
+    len: usize,
+}
+
+impl PidTable {
+    fn new(hint: usize) -> PidTable {
+        let cap = (hint * 2).next_power_of_two().max(64);
+        PidTable { mask: cap - 1, slots: vec![(NONE, 0); cap], len: 0 }
+    }
+    #[inline(always)]
+    fn home(&self, k: Key) -> usize {
+        (mix(k) >> 8) as usize & self.mask
+    }
+    /// The id of k, or inserts k with id `next` (which the caller then registers).
+    #[inline(always)]
+    fn get_or_insert(&mut self, k: Key, next: u32) -> u32 {
+        let mut i = self.home(k);
+        loop {
+            let s = unsafe { self.slots.get_unchecked_mut(i) };
+            if s.0 == k {
+                return s.1;
+            }
+            if s.0 == NONE {
+                *s = (k, next);
+                self.len += 1;
+                if self.len * 2 > self.mask {
+                    self.grow();
+                }
+                return next;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn get(&self, k: Key) -> Option<u32> {
+        let mut i = self.home(k);
+        loop {
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s.0 == k {
+                return Some(s.1);
+            }
+            if s.0 == NONE {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let old = std::mem::take(&mut self.slots);
+        let cap = (self.mask + 1) * 2;
+        self.mask = cap - 1;
+        self.slots = vec![(NONE, 0); cap];
+        for (k, v) in old {
+            if k != NONE {
+                let mut i = self.home(k);
+                while self.slots[i].0 != NONE {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = (k, v);
+            }
+        }
+    }
+}
+
 const RING: usize = 16;
 
 fn log(t0: Instant, msg: &str) {
@@ -770,8 +838,7 @@ fn main() {
         .fold(new_acc, |(mut rv, mut camp), pb| {
             let n: usize = ep_ref.iter().map(|t| t[pb].len()).sum();
             // Live events get a local person id; count them per person and per 30-minute bin.
-            let mut pid_of: FxHashMap<Key, u32> = FxHashMap::default();
-            pid_of.reserve(n / 8 + 16);
+            let mut pid_of = PidTable::new(n / 8);
             let mut persons: Vec<Key> = Vec::new();
             let mut eoff: Vec<u32> = Vec::new();
             let mut bpos: Vec<u32> = vec![0; nbins];
@@ -779,14 +846,11 @@ fn main() {
             for t in ep_ref {
                 for e in &t[pb] {
                     if e.flags & (OK | DEAD) == OK {
-                        let p = match pid_of.entry(e.person) {
-                            std::collections::hash_map::Entry::Occupied(o) => *o.get(),
-                            std::collections::hash_map::Entry::Vacant(v) => {
-                                persons.push(e.person);
-                                eoff.push(0);
-                                *v.insert((persons.len() - 1) as u32)
-                            }
-                        };
+                        let p = pid_of.get_or_insert(e.person, persons.len() as u32);
+                        if p as usize == persons.len() {
+                            persons.push(e.person);
+                            eoff.push(0);
+                        }
                         eoff[p as usize] += 1;
                         let bin = ((e.ts - ws) / HALF_HOUR) as u32;
                         bpos[bin as usize] += 1;
@@ -837,8 +901,8 @@ fn main() {
             let mut coff: Vec<u32> = vec![0; np_ + 1];
             let cpid: Vec<u32> = cks
                 .iter()
-                .map(|c| match pid_of.get(&c.person) {
-                    Some(&p) => {
+                .map(|c| match pid_of.get(c.person) {
+                    Some(p) => {
                         coff[p as usize] += 1;
                         p
                     }

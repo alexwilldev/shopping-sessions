@@ -32,6 +32,28 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+const Y0: i64 = 1970;
+const Y1: i64 = 2100;
+
+/// Day number (days since 1970-01-01) of every valid date in [Y0, Y1), i32::MIN for invalid
+/// ones (Feb 30, Apr 31, ...); index ((y - Y0) * 12 + m - 1) * 32 + d.
+fn day_table() -> &'static [i32] {
+    static T: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = vec![i32::MIN; ((Y1 - Y0) * 12 * 32) as usize];
+        for y in Y0..Y1 {
+            for m in 1..=12i64 {
+                let leap = (y % 4 == 0) & ((y % 100 != 0) | (y % 400 == 0));
+                let dim = DIM[m as usize] as i64 + ((m == 2) & leap) as i64;
+                for d in 1..=dim {
+                    t[(((y - Y0) * 12 + m - 1) * 32 + d) as usize] = days_from_civil(y, m, d) as i32;
+                }
+            }
+        }
+        t
+    })
+}
+
 const DIM: [u8; 16] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0];
 
 /// F1 / F2 (b.len() is 20 or 25).
@@ -56,11 +78,23 @@ fn f12(b: &[u8]) -> Option<i64> {
     let h = ((p1 >> 24) & 0xFF) as i64;
     let mi = ((p1 >> 48) & 0xFF) as i64;
     let s = ((p2 >> 40) & 0xFF) as i64;
-    let leap = (y % 4 == 0) & ((y % 100 != 0) | (y % 400 == 0));
-    let dim = DIM[(mo & 15) as usize] as i64 + ((mo == 2) & leap) as i64;
-    if (mo < 1) | (mo > 12) | (d < 1) | (d > dim) | (h > 23) | (mi > 59) | (s > 59) {
+    if (h > 23) | (mi > 59) | (s > 59) | (mo < 1) | (mo > 12) | (d > 31) {
         return None;
     }
+    let day = if (y >= Y0) & (y < Y1) {
+        let v = unsafe { *day_table().get_unchecked((((y - Y0) * 12 + mo - 1) * 32 + d) as usize) };
+        if v == i32::MIN {
+            return None;
+        }
+        v as i64
+    } else {
+        let leap = (y % 4 == 0) & ((y % 100 != 0) | (y % 400 == 0));
+        let dim = DIM[(mo & 15) as usize] as i64 + ((mo == 2) & leap) as i64;
+        if (d < 1) | (d > dim) {
+            return None;
+        }
+        days_from_civil(y, mo, d)
+    };
     let mut off = 0i64;
     let z = b[19];
     if b.len() == 20 {
@@ -89,7 +123,7 @@ fn f12(b: &[u8]) -> Option<i64> {
         }
         off = sign * (oh * 60 + om);
     }
-    Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s) * 1000 - off * 60_000)
+    Some((day * 86_400 + h * 3600 + mi * 60 + s) * 1000 - off * 60_000)
 }
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ`, F2 `YYYY-MM-DDTHH:MM:SS+HH:MM`, F3 digits (epoch ms).
