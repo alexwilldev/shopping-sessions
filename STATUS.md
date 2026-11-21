@@ -3,7 +3,10 @@
 Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.md` (strategy, phases, budget).
 Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always give the repo URL and the full commit SHA.** 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
 
-**Scored so far (3 of 20 used): 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3, best). Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
+**Scored so far: 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3) → 1.51 s (v3.1 1a1dbd2, best, position 180; Sat 13:30). Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
+
+## v3.2 (c5d7fff, pushed Sat 14:10): bucketed link table, ts day table, assists per (interval, day), SWAR digits. Native gates + 40 fuzz + 60M MATCH; amd64 Docker gate NOT run (OrbStack hung since ~13:58).
+Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse breakdown (M1, events): tokenizer 0.59, keys 0.37, ts 0.27, validation 0.25, resolve 0.28, scatter 0.1; base (links+clicks) 0.53; dedup 0.24; sessions 0.5.
 
 ## v3 (Sat 21 Nov afternoon): rewrite from the competitor-scan list
 - Done: hand-written Parquet writer + `_exit`; u64 packed keys (keys.rs); dense `p<n>`/`c_<n>` lookups; links first, parse resolves persons with a prefetched open-addressing table; person-partitioned 32 B records + 16 B (event_id, loc) dedup records; in-place dedup in ~1024 cache-sized partitions; SIMD bitmask tokenizer (scan.rs, NEON/AVX2, branch-free quotes); SWAR timestamps (ts.rs); MIMALLOC large OS pages env.
