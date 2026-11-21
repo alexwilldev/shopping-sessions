@@ -1,7 +1,7 @@
 # STATUS: Shopping Sessions (resume from this file)
 
 Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.md` (strategy, phases, budget).
-Cutoff: **Sun 2026-11-22 11:00 ET**. 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
+Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always give the repo URL and the full commit SHA.** 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
 
 ## Phase
 **Phase 2: Rust v2 READY (2026-11-20 20:55).** `rust/` (binary `shopsess`), root `Dockerfile` now builds it (`Dockerfile.polars` = v1). Gates: host 36/36 fixtures + exact dev match; Docker arm64 + amd64 `check.sh` PASSED; fuzz 30/30 seeds identical to v1; 20M output identical to v1/DuckDB. Host 20M: **4.5 s** (v1: 54 s); dev 0.29 s; peak RSS 5.4 GB. Docker 20M on the Mac: 11–14 s (dominated by OrbStack's /data file sharing, so use host timings).
