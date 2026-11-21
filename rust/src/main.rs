@@ -20,6 +20,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod keys;
 mod pq;
+mod scan;
+mod ts;
 
 use keys::{Key, NONE, key_cmp, key_of, mix};
 use rayon::prelude::*;
@@ -178,91 +180,7 @@ impl LinkTable {
 
 // ---------------------------------------------------------------- timestamps
 
-#[inline]
-fn d2(b: &[u8], i: usize) -> Option<i64> {
-    let (a, c) = (b[i].wrapping_sub(b'0'), b[i + 1].wrapping_sub(b'0'));
-    if a < 10 && c < 10 { Some((a * 10 + c) as i64) } else { None }
-}
-
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 }
-        }
-    }
-}
-
-/// F1 `YYYY-MM-DDTHH:MM:SSZ`, F2 `YYYY-MM-DDTHH:MM:SS+HH:MM`, F3 digits (epoch ms).
-/// None = bad. F3 with more than 18 significant digits is far outside any window, so None.
-#[inline]
-fn parse_ts(b: &[u8]) -> Option<i64> {
-    if b.is_empty() {
-        return None;
-    }
-    if b.iter().all(u8::is_ascii_digit) {
-        let mut i = 0;
-        while i < b.len() && b[i] == b'0' {
-            i += 1;
-        }
-        let s = &b[i..];
-        if s.len() > 18 {
-            return None;
-        }
-        let mut v: i64 = 0;
-        for &c in s {
-            v = v * 10 + (c - b'0') as i64;
-        }
-        return Some(v);
-    }
-    if b.len() != 20 && b.len() != 25 {
-        return None;
-    }
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-    let y = d2(b, 0)? * 100 + d2(b, 2)?;
-    let mo = d2(b, 5)?;
-    let d = d2(b, 8)?;
-    let h = d2(b, 11)?;
-    let mi = d2(b, 14)?;
-    let s = d2(b, 17)?;
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
-        return None;
-    }
-    let mut off = 0i64;
-    if b.len() == 20 {
-        if b[19] != b'Z' {
-            return None;
-        }
-    } else {
-        let sign = match b[19] {
-            b'+' => 1,
-            b'-' => -1,
-            _ => return None,
-        };
-        if b[22] != b':' {
-            return None;
-        }
-        let oh = d2(b, 20)?;
-        let om = d2(b, 23)?;
-        if oh > 23 || om > 59 {
-            return None;
-        }
-        off = sign * (oh * 60 + om);
-    }
-    Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s) * 1000 - off * 60_000)
-}
+use ts::parse_ts;
 
 /// Purchase price: ASCII digits only, value 1..=10,000,000. None = bad.
 #[inline]
@@ -342,89 +260,10 @@ fn chunks(paths: &[PathBuf]) -> Vec<Chunk> {
     out
 }
 
-const LO: u64 = 0x0101_0101_0101_0101;
-const H7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
-
-/// High bit set in exactly the bytes of `w` equal to `c` (exact, no false positives).
+/// Every well-formed line of a chunk, as N unquoted fields (see scan.rs).
 #[inline(always)]
-fn eq_mask(w: u64, c: u8) -> u64 {
-    let x = w ^ (LO * c as u64);
-    !(((x & H7).wrapping_add(H7)) | x | H7)
-}
-
-/// Single-pass tokenizer: calls f with the N unquoted fields of every well-formed line of the
-/// chunk (rules.md dialect). Scans 8 bytes at a time for ',', '"' and '\n' together.
-/// A field with quotes must be exactly `"..."` (first quote at its start, exactly two quotes,
-/// the second at its end); anything else, or a wrong field count, drops the line.
-#[inline]
-fn for_records<const N: usize>(c: &Chunk, mut f: impl FnMut(&[&[u8]; N])) {
-    let data = &c.map[c.start..c.end];
-    let len = data.len();
-    let mut fields: [&[u8]; N] = [&[]; N];
-    let mut n = 0usize; // fields ended so far on this line
-    let mut fs = 0usize; // start of the current field
-    let mut qc = 0u32; // quotes seen in the current field
-    let mut ql = 0usize; // position of the last quote in the current field
-    let mut bad = false;
-
-    macro_rules! event {
-        ($p:expr) => {{
-            let p: usize = $p;
-            let ch = if p < len { data[p] } else { b'\n' };
-            if ch == b'"' {
-                if qc == 0 && p != fs {
-                    bad = true;
-                }
-                qc += 1;
-                ql = p;
-            } else {
-                // ',' or '\n' ends the field [fs, p)
-                let mut v = &data[fs..p];
-                if qc != 0 {
-                    if qc != 2 || ql + 1 != p || v.len() < 2 {
-                        bad = true;
-                    } else {
-                        v = &v[1..v.len() - 1];
-                    }
-                }
-                if n < N {
-                    fields[n] = v;
-                }
-                n += 1;
-                qc = 0;
-                fs = p + 1;
-                if ch == b'\n' {
-                    if !bad && n == N {
-                        f(&fields);
-                    }
-                    n = 0;
-                    bad = false;
-                }
-            }
-        }};
-    }
-
-    let mut i = 0usize;
-    while i + 8 <= len {
-        let w = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        let mut m = eq_mask(w, b',') | eq_mask(w, b'\n') | eq_mask(w, b'"');
-        while m != 0 {
-            let p = i + (m.trailing_zeros() / 8) as usize;
-            m &= m - 1;
-            event!(p);
-        }
-        i += 8;
-    }
-    while i < len {
-        let ch = data[i];
-        if ch == b',' || ch == b'\n' || ch == b'"' {
-            event!(i);
-        }
-        i += 1;
-    }
-    if fs < len || n > 0 {
-        event!(len); // final line without '\n'
-    }
+fn for_records<const N: usize>(c: &Chunk, f: impl FnMut(&[&[u8]; N])) {
+    scan::for_records::<N>(&c.map[c.start..c.end], f)
 }
 
 fn small_csv<const N: usize>(path: &Path, mut f: impl FnMut(&[&[u8]; N])) {
@@ -705,6 +544,8 @@ fn main() {
                 let (next, ev_chunks, ck_chunks, products, campaigns, links) =
                     (&next, &ev_chunks, &ck_chunks, &products, &campaigns, &links);
                 s.spawn(move || {
+                    let prof: u32 = std::env::var("PROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let mut sink = 0u64;
                     let pe = est_ev / ncpu / np;
                     let pd = est_ev / ncpu / nq;
                     let pc = est_ck / ncpu / np;
@@ -719,6 +560,8 @@ fn main() {
                         if i < ev_chunks.len() {
                             let c = &ev_chunks[i];
                             populate(c);
+                            if prof == 9 { continue; }
+                            if prof == 8 { let d = &c.map[c.start..c.end]; let mut x = 0u64; for w in d.chunks(64) { x = x.wrapping_add(w[0] as u64); } sink = sink.wrapping_add(x); continue; }
                             let mut ring: [(Key, Key, E); RING] =
                                 [(NONE, NONE, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }); RING];
                             let mut n = 0usize;
@@ -735,10 +578,13 @@ fn main() {
                                 if f[0].is_empty() {
                                     return;
                                 }
+                                if prof == 1 { sink = sink.wrapping_add(f[0].len() as u64 + f[3].len() as u64); return; }
                                 let eid = key_of(f[0]);
                                 let user = key_of(f[1]);
+                                if prof == 2 { sink = sink.wrapping_add(eid ^ user); return; }
                                 let ts = parse_ts(f[2]);
                                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+                                if prof == 3 { sink = sink.wrapping_add(eid ^ user ^ ts.unwrap_or(0) as u64 ^ ingest as u64); return; }
                                 let etype = match f[4] {
                                     b"view" => 1,
                                     b"cart" => 2,
@@ -771,6 +617,7 @@ fn main() {
                                 let flags = (ok as u8) | if etype == 3 { PURCHASE } else { 0 };
                                 links.prefetch(user);
                                 let e = E { person: 0, ts: tsv, ingest, price, cat, flags };
+                                if prof == 4 { sink = sink.wrapping_add(eid ^ user ^ e.ts as u64 ^ cat as u64 ^ price as u64); return; }
                                 let slot = &mut ring[n % RING];
                                 if n >= RING {
                                     emit(*slot, &mut ep, &mut dp);
@@ -816,6 +663,7 @@ fn main() {
                             }
                         }
                     }
+                    if sink == 1 { eprintln!("x"); }
                     (ep, dp, cp)
                 })
             })
