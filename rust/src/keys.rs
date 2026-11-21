@@ -60,6 +60,94 @@ fn load_le(b: &[u8], from: usize, n: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// SIMD form of the packing: 16 bytes from p (readable), the first l (1..=10) are the ID.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pack16(p: *const u8, l: usize) -> Option<u64> {
+    unsafe {
+        use core::arch::aarch64::*;
+        const IDX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let live = vcltq_u8(vld1q_u8(IDX.as_ptr()), vdupq_n_u8(l as u8));
+        let v = vandq_u8(vld1q_u8(p), live);
+        let dig = vcltq_u8(vsubq_u8(v, vdupq_n_u8(b'0')), vdupq_n_u8(10));
+        let up = vcltq_u8(vsubq_u8(v, vdupq_n_u8(b'A')), vdupq_n_u8(26));
+        let us = vceqq_u8(v, vdupq_n_u8(b'_'));
+        let lw = vcltq_u8(vsubq_u8(v, vdupq_n_u8(b'a')), vdupq_n_u8(26));
+        let ok = vorrq_u8(vorrq_u8(dig, up), vorrq_u8(us, lw));
+        if vmaxvq_u8(vandq_u8(live, vmvnq_u8(ok))) != 0 {
+            return None;
+        }
+        let code = vorrq_u8(
+            vorrq_u8(vandq_u8(dig, vsubq_u8(v, vdupq_n_u8(47))), vandq_u8(up, vsubq_u8(v, vdupq_n_u8(54)))),
+            vorrq_u8(vandq_u8(us, vdupq_n_u8(37)), vandq_u8(lw, vsubq_u8(v, vdupq_n_u8(59)))),
+        );
+        let t = vreinterpretq_u16_u8(code);
+        let t = vorrq_u16(vshlq_n_u16(vandq_u16(t, vdupq_n_u16(0xFF)), 6), vshrq_n_u16(t, 8));
+        let t = vreinterpretq_u32_u16(t);
+        let t = vorrq_u32(vshlq_n_u32(vandq_u32(t, vdupq_n_u32(0xFFFF)), 12), vshrq_n_u32(t, 16));
+        let t = vreinterpretq_u64_u32(t);
+        let t = vorrq_u64(vshlq_n_u64(vandq_u64(t, vdupq_n_u64(0xFFFF_FFFF)), 24), vshrq_n_u64(t, 32));
+        let (a, b) = (vgetq_lane_u64(t, 0), vgetq_lane_u64(t, 1));
+        Some(((a << 12) | (b >> 36)) << 4)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+#[inline(always)]
+unsafe fn pack16(p: *const u8, l: usize) -> Option<u64> {
+    unsafe {
+        use core::arch::x86_64::*;
+        let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let live = _mm_cmpgt_epi8(_mm_set1_epi8(l as i8), idx);
+        let v = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), live);
+        let inr = |lo: u8, n: u8| {
+            let d = _mm_sub_epi8(v, _mm_set1_epi8(lo as i8));
+            _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8((n - 1) as i8)), d)
+        };
+        let dig = inr(b'0', 10);
+        let up = inr(b'A', 26);
+        let us = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+        let lw = inr(b'a', 26);
+        let ok = _mm_or_si128(_mm_or_si128(dig, up), _mm_or_si128(us, lw));
+        if _mm_movemask_epi8(_mm_andnot_si128(ok, live)) != 0 {
+            return None;
+        }
+        let sub = |c: u8| _mm_sub_epi8(v, _mm_set1_epi8(c as i8));
+        let code = _mm_or_si128(
+            _mm_or_si128(_mm_and_si128(dig, sub(47)), _mm_and_si128(up, sub(54))),
+            _mm_or_si128(_mm_and_si128(us, _mm_set1_epi8(37)), _mm_and_si128(lw, sub(59))),
+        );
+        let p12 = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140)); // even*64 + odd
+        let p24 = _mm_madd_epi16(p12, _mm_set1_epi32(0x0001_1000)); // even*4096 + odd
+        let a = _mm_cvtsi128_si64(p24) as u64;
+        let b = _mm_extract_epi64(p24, 1) as u64;
+        let a = ((a & 0xFFFF_FFFF) << 24) | (a >> 32);
+        let b = ((b & 0xFFFF_FFFF) << 24) | (b >> 32);
+        Some(((a << 12) | (b >> 36)) << 4)
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))))]
+#[inline(always)]
+unsafe fn pack16(p: *const u8, l: usize) -> Option<u64> {
+    let raw = unsafe { std::ptr::read_unaligned(p as *const [u64; 2]) };
+    let lo = u64::from_le(raw[0]);
+    let hi = u64::from_le(raw[1]);
+    let (lo, hi) = if l >= 8 { (lo, hi & ((1u64 << (8 * (l - 8))) - 1)) } else { (lo & ((1u64 << (8 * l)) - 1), 0) };
+    let (c0, c1) = (codes(lo, l.min(8))?, codes(hi, l.saturating_sub(8))?);
+    Some(pack_codes(c0, c1))
+}
+
+#[inline(always)]
+fn pack_codes(c0: u64, c1: u64) -> u64 {
+    let mut x = c0.swap_bytes();
+    x = ((x & 0x3F00_3F00_3F00_3F00) >> 2) | (x & 0x003F_003F_003F_003F);
+    x = ((x & 0x0FFF_0000_0FFF_0000) >> 4) | (x & 0x0000_0FFF_0000_0FFF);
+    x = ((x & 0x00FF_FFFF_0000_0000) >> 8) | (x & 0x0000_0000_00FF_FFFF);
+    let h = ((c1 & 0x3F) << 6) | ((c1 >> 8) & 0x3F);
+    ((x << 12) | h) << 4
+}
+
 #[inline]
 pub fn key_of(b: &[u8]) -> Key {
     let l = b.len();
@@ -68,27 +156,17 @@ pub fn key_of(b: &[u8]) -> Key {
     }
     if l <= 10 {
         let p = b.as_ptr();
-        let (lo, hi) = if (p as usize & 4095) <= 4096 - 16 {
-            // 16 bytes from p stay inside p's page: over-read, then mask
-            let raw = unsafe { std::ptr::read_unaligned(p as *const [u64; 2]) };
-            let lo = u64::from_le(raw[0]);
-            let hi = u64::from_le(raw[1]);
-            if l >= 8 {
-                (lo, hi & ((1u64 << (8 * (l - 8))) - 1))
-            } else {
-                (lo & ((1u64 << (8 * l)) - 1), 0)
+        if (p as usize & 4095) <= 4096 - 16 {
+            // 16 bytes from p stay inside p's page
+            if let Some(k) = unsafe { pack16(p, l) } {
+                return k;
             }
         } else {
-            (load_le(b, 0, l.min(8)), if l > 8 { load_le(b, 8, l - 8) } else { 0 })
-        };
-        if let (Some(c0), Some(c1)) = (codes(lo, l.min(8)), codes(hi, l.saturating_sub(8))) {
-            // pack 8 codes, first byte on top
-            let mut x = c0.swap_bytes();
-            x = ((x & 0x3F00_3F00_3F00_3F00) >> 2) | (x & 0x003F_003F_003F_003F);
-            x = ((x & 0x0FFF_0000_0FFF_0000) >> 4) | (x & 0x0000_0FFF_0000_0FFF);
-            x = ((x & 0x00FF_FFFF_0000_0000) >> 8) | (x & 0x0000_0000_00FF_FFFF);
-            let h = ((c1 & 0x3F) << 6) | ((c1 >> 8) & 0x3F);
-            return ((x << 12) | h) << 4;
+            let lo = load_le(b, 0, l.min(8));
+            let hi = if l > 8 { load_le(b, 8, l - 8) } else { 0 };
+            if let (Some(c0), Some(c1)) = (codes(lo, l.min(8)), codes(hi, l.saturating_sub(8))) {
+                return pack_codes(c0, c1);
+            }
         }
     }
     long_key(b)
