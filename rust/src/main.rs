@@ -131,25 +131,32 @@ impl Dense {
 
 // ---------------------------------------------------------------- link table
 
-/// Read-only open-addressing table: linked ID -> person name, only for IDs that are not
-/// their person's name. Anything else resolves to itself.
+/// Read-only table: linked ID -> person name, only for IDs that are not their person's name
+/// (anything else resolves to itself). Buckets of 4 (key, value) pairs fill one cache line
+/// and are checked without branches; a full bucket continues in the next one (rare).
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Bucket([[Key; 2]; 4]);
+
 struct LinkTable {
     mask: usize,
-    slots: Vec<[Key; 2]>,
+    b: Vec<Bucket>,
 }
 
 impl LinkTable {
     fn new(entries: &[(Key, Key)]) -> LinkTable {
-        let cap = (entries.len() * 2).next_power_of_two().max(16);
-        let t = LinkTable { mask: cap - 1, slots: vec![[NONE, NONE]; cap] };
+        let nb = (entries.len() / 2).next_power_of_two().max(4); // <= 50% full
+        let t = LinkTable { mask: nb - 1, b: vec![Bucket([[NONE, NONE]; 4]); nb] };
         // parallel build: claim an empty key slot with a CAS (keys in `entries` are distinct)
-        let at: &[[AtomicU64; 2]] = unsafe { std::slice::from_raw_parts(t.slots.as_ptr() as *const [AtomicU64; 2], cap) };
+        let at: &[[[AtomicU64; 2]; 4]] = unsafe { std::slice::from_raw_parts(t.b.as_ptr() as *const [[AtomicU64; 2]; 4], nb) };
         entries.par_iter().for_each(|&(k, v)| {
-            let mut i = t.slot(k);
+            let mut i = t.bucket(k);
             loop {
-                if at[i][0].compare_exchange(NONE, k, AO::Relaxed, AO::Relaxed).is_ok() {
-                    at[i][1].store(v, AO::Relaxed);
-                    break;
+                for j in 0..4 {
+                    if at[i][j][0].compare_exchange(NONE, k, AO::Relaxed, AO::Relaxed).is_ok() {
+                        at[i][j][1].store(v, AO::Relaxed);
+                        return;
+                    }
                 }
                 i = (i + 1) & t.mask;
             }
@@ -157,25 +164,29 @@ impl LinkTable {
         t
     }
     #[inline(always)]
-    fn slot(&self, k: Key) -> usize {
+    fn bucket(&self, k: Key) -> usize {
         (mix(k) >> 20) as usize & self.mask
     }
     #[inline(always)]
     fn prefetch(&self, k: Key) {
-        prefetch(unsafe { self.slots.as_ptr().add(self.slot(k)) });
+        prefetch(unsafe { self.b.as_ptr().add(self.bucket(k)) });
     }
     #[inline(always)]
     fn resolve(&self, k: Key) -> Key {
-        if k == NONE {
-            return NONE;
-        }
-        let mut i = self.slot(k);
+        let mut i = self.bucket(k);
         loop {
-            let s = unsafe { *self.slots.get_unchecked(i) };
-            if s[0] == k {
-                return s[1];
+            let b = unsafe { self.b.get_unchecked(i) };
+            let mut found = 0u64;
+            let mut empty = false;
+            for j in 0..4 {
+                let m = ((b.0[j][0] == k) as u64).wrapping_neg();
+                found |= b.0[j][1] & m;
+                empty |= b.0[j][0] == NONE;
             }
-            if s[0] == NONE {
+            if found != 0 {
+                return found;
+            }
+            if empty || k == NONE {
                 return k;
             }
             i = (i + 1) & self.mask;
