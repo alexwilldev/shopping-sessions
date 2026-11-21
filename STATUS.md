@@ -16,6 +16,9 @@ Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse b
 - Single-thread parse CPU on M1: 4.1 s -> 2.8 s; dedup phase 1.4 -> 0.27 CPU-s; sys 2.1 -> 0.7 s.
 - Next: 30-min bins for sessions; link lookups (0.55 s/thread on M1, TLB-bound on 16 KB pages; should be better under THP on the scorer).
 
+## Organizer guidance (via MECHROYALE, Sat ~18:20): leader 0.28 s. Final is ranked on NEW data: "don't overfit" to the generator; exact copies of others' code may be disqualified.
+Our shortcuts are all exact with a general fallback: packed keys fall back to an interned table for any ID (long, non-[0-9A-Za-z_]); `Dense` uses an array only when EVERY product/campaign ID is prefix + canonical number (< 2^22), else an exact hash map; ts table covers 1970-2099 and falls back to the calendar formula; 30-min bins use the manifest window. Keep it that way.
+
 ## Competitor scan (Sat 21 Nov ~13:00 ET; 181 public repos, read for strategy only: COPY NO CODE)
 - Board (per other teams' notes, Sat 10:13): best **0.31 s** (two teams), next 0.42–0.58 s; 0.68 s was 21st of 269. Our 2.09 s is far back.
 - Scorer facts reported by teams that ran probe commits: Cascade Lake Xeon 2.8 GHz (AVX-512 F/BW/VL/VNNI), 8 CPUs via cgroup quota (4 cores + HT), **/data is tmpfs** (input always in RAM, warm), THP=madvise (huge pages work), ~0.1 s fixed overhead, score ≈ own process time. Startup ~50 ms.
