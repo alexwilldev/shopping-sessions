@@ -12,7 +12,6 @@ debug = false
 
 [dependencies]
 libc = "0.2.191"
-memchr = "2.8.3"
 memmap2 = "0.9.12"
 mimalloc = "0.1.52"
 rayon = "1.12.0"

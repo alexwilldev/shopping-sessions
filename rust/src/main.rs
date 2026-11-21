@@ -349,7 +349,7 @@ fn populate(c: &Chunk) {
     let _ = c;
 }
 
-const RING: usize = 8;
+const RING: usize = 16;
 
 fn log(t0: Instant, msg: &str) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -544,8 +544,6 @@ fn main() {
                 let (next, ev_chunks, ck_chunks, products, campaigns, links) =
                     (&next, &ev_chunks, &ck_chunks, &products, &campaigns, &links);
                 s.spawn(move || {
-                    let prof: u32 = std::env::var("PROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let mut sink = 0u64;
                     let pe = est_ev / ncpu / np;
                     let pd = est_ev / ncpu / nq;
                     let pc = est_ck / ncpu / np;
@@ -560,12 +558,10 @@ fn main() {
                         if i < ev_chunks.len() {
                             let c = &ev_chunks[i];
                             populate(c);
-                            if prof == 9 { continue; }
-                            if prof == 8 { let d = &c.map[c.start..c.end]; let mut x = 0u64; for w in d.chunks(64) { x = x.wrapping_add(w[0] as u64); } sink = sink.wrapping_add(x); continue; }
                             let mut ring: [(Key, Key, E); RING] =
                                 [(NONE, NONE, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }); RING];
                             let mut n = 0usize;
-                            let mut emit = |(user, eid, mut e): (Key, Key, E), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
+                            let emit = |(user, eid, mut e): (Key, Key, E), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
                                 let person = links.resolve(user);
                                 e.person = person;
                                 let pp = part(person, pbits);
@@ -578,13 +574,10 @@ fn main() {
                                 if f[0].is_empty() {
                                     return;
                                 }
-                                if prof == 1 { sink = sink.wrapping_add(f[0].len() as u64 + f[3].len() as u64); return; }
                                 let eid = key_of(f[0]);
                                 let user = key_of(f[1]);
-                                if prof == 2 { sink = sink.wrapping_add(eid ^ user); return; }
                                 let ts = parse_ts(f[2]);
                                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                                if prof == 3 { sink = sink.wrapping_add(eid ^ user ^ ts.unwrap_or(0) as u64 ^ ingest as u64); return; }
                                 let etype = match f[4] {
                                     b"view" => 1,
                                     b"cart" => 2,
@@ -617,7 +610,6 @@ fn main() {
                                 let flags = (ok as u8) | if etype == 3 { PURCHASE } else { 0 };
                                 links.prefetch(user);
                                 let e = E { person: 0, ts: tsv, ingest, price, cat, flags };
-                                if prof == 4 { sink = sink.wrapping_add(eid ^ user ^ e.ts as u64 ^ cat as u64 ^ price as u64); return; }
                                 let slot = &mut ring[n % RING];
                                 if n >= RING {
                                     emit(*slot, &mut ep, &mut dp);
@@ -663,7 +655,6 @@ fn main() {
                             }
                         }
                     }
-                    if sink == 1 { eprintln!("x"); }
                     (ep, dp, cp)
                 })
             })
