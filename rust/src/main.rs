@@ -56,9 +56,17 @@ fn key_of(b: &[u8]) -> Key {
         return NONE;
     }
     if b.len() <= 15 {
+        let l = b.len();
+        let p = b.as_ptr();
+        if (p as usize & 4095) <= 4096 - 16 {
+            // 16 bytes from p stay inside p's page, which is mapped: safe to over-read.
+            let raw = u128::from_be_bytes(unsafe { std::ptr::read_unaligned(p as *const [u8; 16]) });
+            let keep = !0u128 << (8 * (16 - l)); // l in 1..=15: keep the first l bytes
+            return (raw & keep) | l as u128;
+        }
         let mut buf = [0u8; 16];
-        buf[..b.len()].copy_from_slice(b);
-        buf[15] = b.len() as u8;
+        buf[..l].copy_from_slice(b);
+        buf[15] = l as u8;
         u128::from_be_bytes(buf)
     } else {
         long_key(b)
@@ -122,40 +130,34 @@ fn bucket(k: Key) -> usize {
 /// Fields come back unquoted; an empty slice means null.
 #[inline]
 fn split_fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
-    let len = line.len();
+    // Split on every comma (a value never holds one); exactly N-1 commas or malformed.
     let mut n = 0;
     let mut start = 0;
-    loop {
-        let end = match line[start..].iter().position(|&c| c == b',') {
-            Some(p) => start + p,
-            None => len,
-        };
-        if n >= N {
+    for p in memchr::memchr_iter(b',', line) {
+        if n + 1 >= N {
             return false;
         }
-        let f = &line[start..end];
-        out[n] = if !f.is_empty() && f[0] == b'"' {
-            if f.len() < 2 || f[f.len() - 1] != b'"' {
-                return false;
-            }
-            let inner = &f[1..f.len() - 1];
-            if inner.contains(&b'"') {
-                return false;
-            }
-            inner
-        } else {
-            if f.contains(&b'"') {
-                return false;
-            }
-            f
-        };
+        out[n] = &line[start..p];
         n += 1;
-        if end == len {
-            break;
-        }
-        start = end + 1;
+        start = p + 1;
     }
-    n == N
+    if n != N - 1 {
+        return false;
+    }
+    out[n] = &line[start..];
+    // Quotes are rare per field: only lines holding a '"' need the per-field check.
+    if memchr::memchr(b'"', line).is_some() {
+        for f in out.iter_mut() {
+            if memchr::memchr(b'"', f).is_some() {
+                let l = f.len();
+                if l < 2 || f[0] != b'"' || f[l - 1] != b'"' || memchr::memchr(b'"', &f[1..l - 1]).is_some() {
+                    return false;
+                }
+                *f = &f[1..l - 1];
+            }
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------- timestamps
@@ -329,24 +331,103 @@ fn chunks(paths: &[PathBuf]) -> Vec<Chunk> {
 fn for_lines(c: &Chunk, mut f: impl FnMut(&[u8])) {
     let data = &c.map[c.start..c.end];
     let mut s = 0;
-    while s < data.len() {
-        let e = match data[s..].iter().position(|&c| c == b'\n') {
-            Some(i) => s + i,
-            None => data.len(),
-        };
+    for e in memchr::memchr_iter(b'\n', data) {
         f(&data[s..e]);
         s = e + 1;
+    }
+    if s < data.len() {
+        f(&data[s..]); // final line without '\n'
+    }
+}
+
+const LO: u64 = 0x0101_0101_0101_0101;
+const H7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+
+/// High bit set in exactly the bytes of `w` equal to `c` (exact, no false positives).
+#[inline(always)]
+fn eq_mask(w: u64, c: u8) -> u64 {
+    let x = w ^ (LO * c as u64);
+    !(((x & H7).wrapping_add(H7)) | x | H7)
+}
+
+/// Single-pass tokenizer: calls f with the N unquoted fields of every well-formed line of the
+/// chunk (rules.md dialect). Scans 8 bytes at a time for ',', '"' and '\n' together.
+/// A field with quotes must be exactly `"..."` (first quote at its start, exactly two quotes,
+/// the second at its end); anything else, or a wrong field count, drops the line.
+#[inline]
+fn for_records<const N: usize>(c: &Chunk, mut f: impl FnMut(&[&[u8]; N])) {
+    let data = &c.map[c.start..c.end];
+    let len = data.len();
+    let mut fields: [&[u8]; N] = [&[]; N];
+    let mut n = 0usize; // fields ended so far on this line
+    let mut fs = 0usize; // start of the current field
+    let mut qc = 0u32; // quotes seen in the current field
+    let mut ql = 0usize; // position of the last quote in the current field
+    let mut bad = false;
+
+    macro_rules! event {
+        ($p:expr) => {{
+            let p: usize = $p;
+            let ch = if p < len { data[p] } else { b'\n' };
+            if ch == b'"' {
+                if qc == 0 && p != fs {
+                    bad = true;
+                }
+                qc += 1;
+                ql = p;
+            } else {
+                // ',' or '\n' ends the field [fs, p)
+                let mut v = &data[fs..p];
+                if qc != 0 {
+                    if qc != 2 || ql + 1 != p || v.len() < 2 {
+                        bad = true;
+                    } else {
+                        v = &v[1..v.len() - 1];
+                    }
+                }
+                if n < N {
+                    fields[n] = v;
+                }
+                n += 1;
+                qc = 0;
+                fs = p + 1;
+                if ch == b'\n' {
+                    if !bad && n == N {
+                        f(&fields);
+                    }
+                    n = 0;
+                    bad = false;
+                }
+            }
+        }};
+    }
+
+    let mut i = 0usize;
+    while i + 8 <= len {
+        let w = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let mut m = eq_mask(w, b',') | eq_mask(w, b'\n') | eq_mask(w, b'"');
+        while m != 0 {
+            let p = i + (m.trailing_zeros() / 8) as usize;
+            m &= m - 1;
+            event!(p);
+        }
+        i += 8;
+    }
+    while i < len {
+        let ch = data[i];
+        if ch == b',' || ch == b'\n' || ch == b'"' {
+            event!(i);
+        }
+        i += 1;
+    }
+    if fs < len || n > 0 {
+        event!(len); // final line without '\n'
     }
 }
 
 fn small_csv<const N: usize>(path: &Path, mut f: impl FnMut(&[&[u8]; N])) {
     for c in &chunks(&[path.to_path_buf()]) {
-        for_lines(c, |line| {
-            let mut fl: [&[u8]; N] = [&[]; N];
-            if split_fields(line, &mut fl) {
-                f(&fl);
-            }
-        });
+        for_records::<N>(c, |fl| f(fl));
     }
 }
 
@@ -484,9 +565,8 @@ fn main() {
         .par_iter()
         .flat_map_iter(|c| {
             let mut v = Vec::new();
-            for_lines(c, |line| {
-                let mut f: [&[u8]; 2] = [&[]; 2];
-                if split_fields(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+            for_records::<2>(c, |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
                     v.push((key_of(f[0]), key_of(f[1])));
                 }
             });
@@ -549,9 +629,8 @@ fn main() {
         .par_iter()
         .map(|c| {
             let mut b: Vec<Vec<Click>> = (0..NB).map(|_| Vec::new()).collect();
-            for_lines(c, |line| {
-                let mut f: [&[u8]; 4] = [&[]; 4];
-                if !split_fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+            for_records::<4>(c, |f| {
+                if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
                 let Some(&camp) = camp_idx.get(&key_of(f[2])) else { return };
@@ -572,10 +651,11 @@ fn main() {
     let ev_parts: Vec<Vec<Vec<RawEv>>> = ev_chunks
         .par_iter()
         .map(|c| {
-            let mut b: Vec<Vec<RawEv>> = (0..NB).map(|_| Vec::new()).collect();
-            for_lines(c, |line| {
-                let mut f: [&[u8]; 7] = [&[]; 7];
-                if !split_fields(line, &mut f) || f[0].is_empty() {
+            // ~75 bytes per event line; pre-size so the buckets rarely reallocate
+            let per = (c.end - c.start) / 75 / NB;
+            let mut b: Vec<Vec<RawEv>> = (0..NB).map(|_| Vec::with_capacity(per + per / 4 + 8)).collect();
+            for_records::<7>(c, |f| {
+                if f[0].is_empty() {
                     return;
                 }
                 let eid = key_of(f[0]);
@@ -608,22 +688,34 @@ fn main() {
         .into_par_iter()
         .map(|bi| {
             let n: usize = ev_parts.iter().map(|p| p[bi].len()).sum();
-            let mut best: FxHashMap<Key, (i64, u32, u32)> = FxHashMap::default();
-            best.reserve(n);
-            for (pi, p) in ev_parts.iter().enumerate() {
-                for (ri, r) in p[bi].iter().enumerate() {
-                    best.entry(r.eid)
-                        .and_modify(|e| {
-                            if r.ingest < e.0 {
-                                *e = (r.ingest, pi as u32, ri as u32)
-                            }
-                        })
-                        .or_insert((r.ingest, pi as u32, ri as u32));
+            let mut recs: Vec<RawEv> = Vec::with_capacity(n);
+            for p in &ev_parts {
+                recs.extend_from_slice(&p[bi]);
+            }
+            // keep[i]: recs[i] is the copy with the smallest ingest_ts of its event_id
+            let mut keep = vec![true; n];
+            let mut first: FxHashMap<Key, u32> = FxHashMap::default();
+            first.reserve(n);
+            for i in 0..n {
+                match first.entry(recs[i].eid) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(i as u32);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        let j = *o.get() as usize;
+                        if recs[i].ingest < recs[j].ingest {
+                            keep[j] = false;
+                            o.insert(i as u32);
+                        } else {
+                            keep[i] = false;
+                        }
+                    }
                 }
             }
-            let mut out: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::new()).collect();
-            for (_, (_, pi, ri)) in best {
-                let r = &ev_parts[pi as usize][bi][ri as usize];
+            drop(first);
+            let per = n / NB + n / NB / 4 + 8;
+            let mut out: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(per)).collect();
+            for (r, _) in recs.iter().zip(keep.iter()).filter(|(_, k)| **k) {
                 if r.person == NONE
                     || r.ts == i64::MIN
                     || r.ts < ws
@@ -779,8 +871,20 @@ fn main() {
     }
     std::fs::create_dir_all(out.join("user_daily")).unwrap();
     std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
-    let user_rows: Vec<UserRow> = results.iter().flat_map(|(r, _)| r.iter().copied()).collect();
-    write_user(&out.join("user_daily/part-0.parquet"), &user_rows, &cat_names);
+    // user_daily as several Parquet files written in parallel (rules: one or more files).
+    const PARTS: usize = 8;
+    let per_part = NB.div_ceil(PARTS);
+    let n_user: usize = (0..PARTS)
+        .into_par_iter()
+        .map(|p| {
+            let rows: Vec<UserRow> = results[(p * per_part).min(NB)..((p + 1) * per_part).min(NB)]
+                .iter()
+                .flat_map(|(r, _)| r.iter().copied())
+                .collect();
+            write_user(&out.join(format!("user_daily/part-{p}.parquet")), &rows, &cat_names);
+            rows.len()
+        })
+        .sum();
 
     let (mut cids, mut chans, mut days) = (Vec::new(), Vec::new(), Vec::new());
     let mut vals: [Vec<i64>; 4] = Default::default();
@@ -804,7 +908,7 @@ fn main() {
         }
     }
     write_campaign(&out.join("campaign_daily/part-0.parquet"), &cids, &chans, &days, &vals);
-    log(t0, &format!("done: {} user rows, {} campaign rows", user_rows.len(), days.len()));
+    log(t0, &format!("done: {} user rows, {} campaign rows", n_user, days.len()));
 }
 
 // ---------------------------------------------------------------- parquet
