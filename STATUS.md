@@ -5,6 +5,20 @@ Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always gi
 
 **Scored so far (3 of 20 used): 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3, best). Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
 
+## Competitor scan (Sat 21 Nov ~13:00 ET; 181 public repos, read for strategy only: COPY NO CODE)
+- Board (per other teams' notes, Sat 10:13): best **0.31 s** (two teams), next 0.42–0.58 s; 0.68 s was 21st of 269. Our 2.09 s is far back.
+- Scorer facts reported by teams that ran probe commits: Cascade Lake Xeon 2.8 GHz (AVX-512 F/BW/VL/VNNI), 8 CPUs via cgroup quota (4 cores + HT), **/data is tmpfs** (input always in RAM, warm), THP=madvise (huge pages work), ~0.1 s fixed overhead, score ≈ own process time. Startup ~50 ms.
+- Techniques the fast teams (0.68–1.0 s on the board) report, ranked by likely gain for us:
+  1. **Fast exit**: `_exit` right after the output files are written; never free the big arenas (we `drop()` evs/cks/pid_of at the end).
+  2. **Hand-written Parquet writer** instead of the parquet crate (write phase 0.12→0.05 s for one team); INT32 counts, no stats, one write(2) per file.
+  3. **Packed u64 keys**: IDs of ≤10 chars [0-9a-z] packed exactly into a u64 (others go to an exact fallback table); **dense array index for products/campaigns**.
+  4. **Sessions without sorting**: put each person's events in 30-minute bins; consecutive occupied bins merge when next.min − prev.max ≤ 30 min. Alternatively, counting sort plus radix sort by (person rank, ts).
+  5. **Size dedup and grouping so they stay in cache**: about 1024 partitions so each per-bucket table fits in L2; open addressing with **software prefetch** (batched lookups, prefetch 8–16 ahead); dedup marks the losing copies in place.
+  6. **Huge pages**: MADV_HUGEPAGE / pre-fault the arenas; mmap the input (tmpfs means zero copy).
+  7. Build for `target-cpu=cascadelake` (AVX-512 structural CSV scan; SWAR or SIMD timestamps with a date table).
+  8. Lock-free parallel union-find with an atomic min for the person name; link table filled during the parse.
+- Local A/B method used by several teams: pin to 4 cores + HT siblings, warm cache, median of 5+, CPU time per phase.
+
 **Machine reserved for MACHINA-CAD from Sat 01:40 to ~08:00 (user-approved): no benchmarks, no Docker, no CPU claims, no big network transfers in that window.**
 **To beat 0.65 s, total CPU must fall ~4×: the remaining big cost is ~4 hash lookups per event (product, dedup, resolve, pid). Ideas: array lookup for structured IDs (p<digits>, c_<digits>) with a map fallback; fuse dedup with grouping; avoid the 64 B RawEv round trip.**
 
