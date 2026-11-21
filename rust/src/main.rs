@@ -29,7 +29,7 @@ use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AO};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AO};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
@@ -141,14 +141,19 @@ struct LinkTable {
 impl LinkTable {
     fn new(entries: &[(Key, Key)]) -> LinkTable {
         let cap = (entries.len() * 2).next_power_of_two().max(16);
-        let mut t = LinkTable { mask: cap - 1, slots: vec![[NONE, NONE]; cap] };
-        for &(k, v) in entries {
+        let t = LinkTable { mask: cap - 1, slots: vec![[NONE, NONE]; cap] };
+        // parallel build: claim an empty key slot with a CAS (keys in `entries` are distinct)
+        let at: &[[AtomicU64; 2]] = unsafe { std::slice::from_raw_parts(t.slots.as_ptr() as *const [AtomicU64; 2], cap) };
+        entries.par_iter().for_each(|&(k, v)| {
             let mut i = t.slot(k);
-            while t.slots[i][0] != NONE {
+            loop {
+                if at[i][0].compare_exchange(NONE, k, AO::Relaxed, AO::Relaxed).is_ok() {
+                    at[i][1].store(v, AO::Relaxed);
+                    break;
+                }
                 i = (i + 1) & t.mask;
             }
-            t.slots[i] = [k, v];
-        }
+        });
         t
     }
     #[inline(always)]
@@ -306,9 +311,11 @@ struct C {
     camp: u16,
 }
 
+/// A live event in the sessions phase: local person id, 30-minute bin of the window.
 #[derive(Clone, Copy)]
 struct Ev {
-    person: Key,
+    pid: u32,
+    bin: u32,
     ts: i64,
     price: u32,
     cat: u16,
@@ -481,44 +488,68 @@ fn main() {
         })
         .collect();
     drop(pairs);
-    let mut parent: Vec<u32> = (0..ids.len() as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = parent[x as usize];
+    // Lock-free union-find: a root is only ever linked (CAS) under a smaller root, so every
+    // parent is <= its child and each component's root is its smallest index.
+    let parent: Vec<AtomicU32> = (0..ids.len() as u32).into_par_iter().map(AtomicU32::new).collect();
+    fn find(p: &[AtomicU32], mut x: u32) -> u32 {
+        loop {
+            let px = p[x as usize].load(AO::Relaxed);
+            if px == x {
+                return x;
+            }
+            let gp = p[px as usize].load(AO::Relaxed);
+            if gp != px {
+                let _ = p[x as usize].compare_exchange_weak(px, gp, AO::Relaxed, AO::Relaxed);
+            }
+            x = gp;
         }
-        x
     }
-    for v in &ix {
+    ix.par_iter().for_each(|v| {
         for &(a, b) in v {
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            if ra != rb {
-                // the smaller index becomes the root: with packed keys that is the name
-                if ra < rb { parent[rb as usize] = ra } else { parent[ra as usize] = rb }
+            let (mut a, mut b) = (a, b);
+            loop {
+                let (ra, rb) = (find(&parent, a), find(&parent, b));
+                if ra == rb {
+                    break;
+                }
+                let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                if parent[hi as usize].compare_exchange(hi, lo, AO::AcqRel, AO::Relaxed).is_ok() {
+                    break;
+                }
+                a = ra;
+                b = rb;
             }
         }
-    }
+    });
     drop(ix);
-    let mut name: Vec<Key> = vec![NONE; ids.len()];
-    let mut entries: Vec<(Key, Key)> = Vec::with_capacity(ids.len());
-    for i in 0..ids.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        let k = ids[i];
-        if name[r] == NONE || key_cmp(k, name[r]) == Ordering::Less {
-            name[r] = k;
+    // ids are sorted by key, and packed keys sort byte-wise: the root's ID is the name.
+    // Long (interned) keys do not sort byte-wise, so then the name is found by comparison.
+    let entries: Vec<(Key, Key)> = if !ids.par_iter().any(|&k| keys::is_long(k)) {
+        (0..ids.len())
+            .into_par_iter()
+            .filter_map(|i| {
+                let r = find(&parent, i as u32) as usize;
+                if r != i { Some((ids[i], ids[r])) } else { None }
+            })
+            .collect()
+    } else {
+        let mut name: Vec<Key> = vec![NONE; ids.len()];
+        for i in 0..ids.len() {
+            let r = find(&parent, i as u32) as usize;
+            if name[r] == NONE || key_cmp(ids[i], name[r]) == Ordering::Less {
+                name[r] = ids[i];
+            }
         }
-    }
-    for i in 0..ids.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        if ids[i] != name[r] {
-            entries.push((ids[i], name[r]));
-        }
-    }
+        (0..ids.len())
+            .filter_map(|i| {
+                let r = find(&parent, i as u32) as usize;
+                if ids[i] != name[r] { Some((ids[i], name[r])) } else { None }
+            })
+            .collect()
+    };
     let links = LinkTable::new(&entries);
     log(t0, &format!("links: {} ids, {} non-name", ids.len(), entries.len()));
     drop(entries);
-    drop(name);
     drop(parent);
     drop(ids);
 
@@ -722,66 +753,75 @@ fn main() {
     type Acc = (Vec<(usize, Vec<UserRow>)>, Vec<[i64; 4]>);
     let new_acc = || -> Acc { (Vec::new(), vec![[0i64; 4]; ncamp * nd]) };
     let (ep_ref, cp_ref) = (&ep_all, &cp_all);
+    let nbins = ((we - ws + HALF_HOUR - 1) / HALF_HOUR).max(1) as usize;
     let (mut results, camp): Acc = (0..np)
         .into_par_iter()
         .fold(new_acc, |(mut rv, mut camp), pb| {
             let n: usize = ep_ref.iter().map(|t| t[pb].len()).sum();
+            // Live events get a local person id; count them per person and per 30-minute bin.
+            let mut pid_of: FxHashMap<Key, u32> = FxHashMap::default();
+            pid_of.reserve(n / 8 + 16);
+            let mut persons: Vec<Key> = Vec::new();
+            let mut eoff: Vec<u32> = Vec::new();
+            let mut bpos: Vec<u32> = vec![0; nbins];
             let mut evs: Vec<Ev> = Vec::with_capacity(n);
             for t in ep_ref {
                 for e in &t[pb] {
                     if e.flags & (OK | DEAD) == OK {
-                        evs.push(Ev { person: e.person, ts: e.ts, price: e.price, cat: e.cat, purchase: e.flags & PURCHASE != 0 });
+                        let p = match pid_of.entry(e.person) {
+                            std::collections::hash_map::Entry::Occupied(o) => *o.get(),
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                persons.push(e.person);
+                                eoff.push(0);
+                                *v.insert((persons.len() - 1) as u32)
+                            }
+                        };
+                        eoff[p as usize] += 1;
+                        let bin = ((e.ts - ws) / HALF_HOUR) as u32;
+                        bpos[bin as usize] += 1;
+                        evs.push(Ev { pid: p, bin, ts: e.ts, price: e.price, cat: e.cat, purchase: e.flags & PURCHASE != 0 });
                     }
                 }
             }
+            let np_ = persons.len();
+            // LSD counting sort: by bin, then stably by person. Each person's events come out
+            // in bin order; inside a bin the order does not matter (a bin is 30 minutes, so
+            // its events always share a session).
+            let mut acc = 0u32;
+            for c in bpos.iter_mut() {
+                let x = *c;
+                *c = acc;
+                acc += x;
+            }
+            let mut tmp: Vec<Ev> = Vec::with_capacity(evs.len());
+            unsafe { tmp.set_len(evs.len()) };
+            for e in &evs {
+                let q = &mut bpos[e.bin as usize];
+                unsafe { *tmp.get_unchecked_mut(*q as usize) = *e };
+                *q += 1;
+            }
+            let mut acc = 0u32;
+            for c in eoff.iter_mut() {
+                let x = *c;
+                *c = acc;
+                acc += x;
+            }
+            eoff.push(acc);
+            {
+                let mut pos: Vec<u32> = eoff[..np_].to_vec();
+                for e in &tmp {
+                    let q = &mut pos[e.pid as usize];
+                    unsafe { *evs.get_unchecked_mut(*q as usize) = *e };
+                    *q += 1;
+                }
+            }
+            drop(tmp);
             let mut cks: Vec<Click> = Vec::with_capacity(cp_ref.iter().map(|t| t[pb].len()).sum());
             for t in cp_ref {
                 for c in &t[pb] {
                     cks.push(Click { person: c.person, ts: c.ts, cid: c.cid, camp: c.camp });
                 }
             }
-            // Group by person with a counting sort on local person ids, then sort each
-            // person's events by ts. Equal timestamps are adjacent, so a tie never starts a
-            // session whatever order ties come in.
-            let mut pid_of: FxHashMap<Key, u32> = FxHashMap::default();
-            pid_of.reserve(evs.len() / 8 + 16);
-            let mut persons: Vec<Key> = Vec::new();
-            let mut eoff: Vec<u32> = Vec::new();
-            let epid: Vec<u32> = evs
-                .iter()
-                .map(|e| {
-                    let p = *pid_of.entry(e.person).or_insert_with(|| {
-                        persons.push(e.person);
-                        eoff.push(0);
-                        (persons.len() - 1) as u32
-                    });
-                    eoff[p as usize] += 1;
-                    p
-                })
-                .collect();
-            let np_ = persons.len();
-            let mut acc = 0u32;
-            for c in eoff.iter_mut() {
-                let n = *c;
-                *c = acc;
-                acc += n;
-            }
-            eoff.push(acc);
-            let mut grouped: Vec<Ev> = Vec::with_capacity(evs.len());
-            unsafe { grouped.set_len(evs.len()) };
-            {
-                let mut pos: Vec<u32> = eoff[..np_].to_vec();
-                for (e, &p) in evs.iter().zip(epid.iter()) {
-                    grouped[pos[p as usize] as usize] = *e;
-                    pos[p as usize] += 1;
-                }
-            }
-            drop(evs);
-            drop(epid);
-            for p in 0..np_ {
-                grouped[eoff[p] as usize..eoff[p + 1] as usize].sort_unstable_by_key(|e| e.ts);
-            }
-            let evs = grouped;
             // clicks: only persons with events matter (others can't credit or assist anything)
             let mut coff: Vec<u32> = vec![0; np_ + 1];
             let cpid: Vec<u32> = cks
@@ -830,48 +870,73 @@ fn main() {
                 let pc = &cks[coff[p] as usize..coff[p + 1] as usize];
                 starts.clear();
                 let mut row = UserRow { person, day: i32::MIN, sessions: 0, events: 0, revenue: 0, top: None };
-                let mut k = i;
                 let mut cp = 0usize; // clicks with ts <= current start are pc[..cp]
                 let mut grp = 0usize; // first click of the latest-ts group in pc[..cp]
-                while k < iend {
-                    let start = evs[k].ts;
-                    let sday = start.div_euclid(DAY);
-                    if sday as i32 != row.day {
-                        flush_row(&mut row, &mut rows, &mut catrev, &mut touched, &cat_rank);
-                        row = UserRow { person, day: sday as i32, sessions: 0, events: 0, revenue: 0, top: None };
-                    }
-                    let mut last = start;
-                    let (mut n, mut rev, mut purch) = (0i64, 0i64, false);
-                    while k < iend && evs[k].ts - last <= HALF_HOUR {
-                        let e = &evs[k];
-                        last = e.ts;
-                        n += 1;
-                        if e.purchase {
-                            purch = true;
-                            rev += e.price as i64;
-                            if catrev[e.cat as usize] == 0 {
-                                touched.push(e.cat);
+                let (mut open, mut start, mut sday, mut prev_max) = (false, 0i64, 0i64, 0i64);
+                let (mut n, mut rev, mut purch) = (0i64, 0i64, false);
+                macro_rules! close {
+                    () => {{
+                        row.sessions += 1;
+                        row.events += n;
+                        row.revenue += rev;
+                        starts.push(start);
+                        // credit: latest click at or before the start; ties -> smallest click_id
+                        while cp < pc.len() && pc[cp].ts <= start {
+                            if cp == 0 || pc[cp].ts != pc[cp - 1].ts {
+                                grp = cp;
                             }
-                            catrev[e.cat as usize] += e.price as i64;
+                            cp += 1;
                         }
-                        k += 1;
+                        let credited = if cp > 0 && start - pc[grp].ts <= WEEK { pc[grp].camp } else { organic };
+                        let s = &mut camp[credited as usize * nd + (sday - day0) as usize];
+                        s[0] += 1;
+                        s[1] += purch as i64;
+                        s[2] += rev;
+                    }};
+                }
+                let mut k = i;
+                while k < iend {
+                    // one bin: its min and max ts decide whether it continues the session
+                    let b = evs[k].bin;
+                    let mut e = k;
+                    let (mut mn, mut mx) = (i64::MAX, i64::MIN);
+                    while e < iend && evs[e].bin == b {
+                        let t = evs[e].ts;
+                        mn = mn.min(t);
+                        mx = mx.max(t);
+                        e += 1;
                     }
-                    row.sessions += 1;
-                    row.events += n;
-                    row.revenue += rev;
-                    starts.push(start);
-                    // credit: latest click at or before the start; ties -> smallest click_id
-                    while cp < pc.len() && pc[cp].ts <= start {
-                        if cp == 0 || pc[cp].ts != pc[cp - 1].ts {
-                            grp = cp;
+                    if !open || mn - prev_max > HALF_HOUR {
+                        if open {
+                            close!();
                         }
-                        cp += 1;
+                        open = true;
+                        start = mn;
+                        sday = start.div_euclid(DAY);
+                        if sday as i32 != row.day {
+                            flush_row(&mut row, &mut rows, &mut catrev, &mut touched, &cat_rank);
+                            row = UserRow { person, day: sday as i32, sessions: 0, events: 0, revenue: 0, top: None };
+                        }
+                        n = 0;
+                        rev = 0;
+                        purch = false;
                     }
-                    let credited = if cp > 0 && start - pc[grp].ts <= WEEK { pc[grp].camp } else { organic };
-                    let s = &mut camp[credited as usize * nd + (sday - day0) as usize];
-                    s[0] += 1;
-                    s[1] += purch as i64;
-                    s[2] += rev;
+                    for ev in &evs[k..e] {
+                        n += 1;
+                        if ev.purchase {
+                            purch = true;
+                            rev += ev.price as i64;
+                            if catrev[ev.cat as usize] == 0 {
+                                touched.push(ev.cat);
+                            }
+                            catrev[ev.cat as usize] += ev.price as i64;
+                        }
+                    }
+                    prev_max = mx;
+                    k = e;
+                }
+                if open {
+                    close!();
                 }
                 flush_row(&mut row, &mut rows, &mut catrev, &mut touched, &cat_rank);
                 // assists: each campaign's clicks cover [ts, ts + 7d]; merge the coverage and

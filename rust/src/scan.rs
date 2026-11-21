@@ -96,7 +96,6 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [
         let (comma, nlm, quote) = if b + 64 <= len {
             block_masks(unsafe { base.add(b) })
         } else {
-            tail = [0u8; 64];
             tail[..len - b].copy_from_slice(&data[b..]);
             block_masks(tail.as_ptr())
         };
