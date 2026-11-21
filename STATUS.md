@@ -15,6 +15,7 @@ Older: **Phase 1: v1 READY TO SUBMIT (2026-11-20 20:25).** Polars v1: `make chec
 - Host timings are noisy (load averages of 30–80 seen). Compare engines within one run, not across runs.
 
 ## Harness (how to use)
+- **Linux-like timing:** `scripts/vbench.sh IMAGE shop5m 3`. Docker volume `shop5m` holds data/gen5m inside the OrbStack VM (no macOS file sharing). The binary logs user/sys CPU and minor faults per stage. Use CPU time as the metric; wall time is noisy while other tracks run.
 - `source ~/.cargo/env` (rustc 1.100). Generator: `bin/generate` (macOS arm64).
 - Script Python: `.venv/bin/python` (polars 2.1.0, duckdb 1.5.6, scipy, numpy, pyarrow).
 - Data (gitignored): `data/dev` (seed 1, = the public dev set), `data/gen20m` (seed 20, 20M/5M, 1.8 GB), `data/gen60m` (seed 60, 60M/15M, 5.4 GB).
@@ -69,7 +70,9 @@ events parse ≈ 240 ns/line after the tokenizer (was 350). Remaining per-line c
 |---|---|---|---|---|---|---|
 | 1 | 11-20 ~20:30 | 9b66a08 | Polars v1 | passed | **37.48 s** (rank 68; 83 ms wait) | leader 0.93 s |
 | 2 | 11-20 ~21:00 | 98755db | Rust v2 | passed | **3.39 s** (rank 61; 60 ms wait) | |
-| 3 | slot 21:32 | 23383b3 (+STATUS-only commit after) | Rust v2.1 | local gates + fuzz 30/30 passed | pending | SWAR tokenizer, fast key_of, contiguous dedup, parallel user_daily write; 20M user CPU 12.6 → 8.7 s |
+| 3 | slot 21:32 | 528424a | Rust v2.1 | local gates + fuzz 30/30 passed | pending | SWAR tokenizer, fast key_of, contiguous dedup, parallel user_daily write; 20M user CPU 12.6 → 8.7 s |
+
+| 4 | next slot | v2.2 (HEAD at handover) | Rust v2.2 | all gates + fuzz 30/30 | pending | links concurrent with parsing; users resolved after dedup; Linux 5M user CPU 2.33 → 1.77 s |
 
 ## Local bench log (relative only)
 | Date | Impl | Dataset | Where | Wall time | Notes |
