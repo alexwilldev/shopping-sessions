@@ -571,21 +571,35 @@ fn main() {
             v
         })
         .collect();
-    let mut ids: Vec<Key> = pairs.par_iter().flat_map_iter(|v| v.iter().flat_map(|&(a, b)| [a, b])).collect();
-    ids.par_sort_unstable();
-    ids.dedup();
-    let ix: Vec<Vec<(u32, u32)>> = pairs
-        .par_iter()
-        .map(|v| {
-            v.iter()
-                .map(|&(a, b)| (ids.binary_search(&a).unwrap() as u32, ids.binary_search(&b).unwrap() as u32))
-                .collect()
-        })
-        .collect();
+    // Intern every linked ID in a lock-free open-addressing table; the slot is the index.
+    let npairs: usize = pairs.iter().map(|v| v.len()).sum();
+    let cap = (npairs * 4).next_power_of_two().max(64); // <= 2 IDs per pair: at most half full
+    let tmask = cap - 1;
+    let tk_store: Vec<Key> = vec![NONE; cap];
+    let tk: &[AtomicU64] = unsafe { std::slice::from_raw_parts(tk_store.as_ptr() as *const AtomicU64, cap) };
+    let intern = |k: Key| -> u32 {
+        let mut i = (mix(k) >> 20) as usize & tmask;
+        loop {
+            let cur = tk[i].load(AO::Relaxed);
+            if cur == k {
+                return i as u32;
+            }
+            if cur == NONE {
+                match tk[i].compare_exchange(NONE, k, AO::Relaxed, AO::Relaxed) {
+                    Ok(_) => return i as u32,
+                    Err(a) if a == k => return i as u32,
+                    Err(_) => {}
+                }
+            }
+            i = (i + 1) & tmask;
+        }
+    };
+    let ix: Vec<Vec<(u32, u32)>> = pairs.par_iter().map(|v| v.iter().map(|&(a, b)| (intern(a), intern(b))).collect()).collect();
+    let any_long = pairs.par_iter().any(|v| v.iter().any(|&(a, b)| keys::is_long(a) || keys::is_long(b)));
     drop(pairs);
-    // Lock-free union-find: a root is only ever linked (CAS) under a smaller root, so every
-    // parent is <= its child and each component's root is its smallest index.
-    let parent: Vec<AtomicU32> = (0..ids.len() as u32).into_par_iter().map(AtomicU32::new).collect();
+    // Lock-free union-find: a root is only ever linked (CAS) under a smaller root (by slot
+    // index), so every parent is <= its child.
+    let parent: Vec<AtomicU32> = (0..cap as u32).into_par_iter().map(AtomicU32::new).collect();
     fn find(p: &[AtomicU32], mut x: u32) -> u32 {
         loop {
             let px = p[x as usize].load(AO::Relaxed);
@@ -617,36 +631,54 @@ fn main() {
         }
     });
     drop(ix);
-    // ids are sorted by key, and packed keys sort byte-wise: the root's ID is the name.
-    // Long (interned) keys do not sort byte-wise, so then the name is found by comparison.
-    let entries: Vec<(Key, Key)> = if !ids.par_iter().any(|&k| keys::is_long(k)) {
-        (0..ids.len())
+    // Name = byte-wise smallest ID of the component: an atomic min per root (packed keys
+    // compare byte-wise as integers); with long (interned) keys, by comparison, serially.
+    let ids: Vec<u64> = tk.par_iter().map(|a| a.load(AO::Relaxed)).collect();
+    let entries: Vec<(Key, Key)> = if !any_long {
+        let name: Vec<AtomicU64> = (0..cap).into_par_iter().map(|_| AtomicU64::new(u64::MAX)).collect();
+        (0..cap).into_par_iter().for_each(|i| {
+            if ids[i] != NONE {
+                name[find(&parent, i as u32) as usize].fetch_min(ids[i], AO::Relaxed);
+            }
+        });
+        (0..cap)
             .into_par_iter()
             .filter_map(|i| {
-                let r = find(&parent, i as u32) as usize;
-                if r != i { Some((ids[i], ids[r])) } else { None }
+                if ids[i] == NONE {
+                    return None;
+                }
+                let n = name[find(&parent, i as u32) as usize].load(AO::Relaxed);
+                if ids[i] != n { Some((ids[i], n)) } else { None }
             })
             .collect()
     } else {
-        let mut name: Vec<Key> = vec![NONE; ids.len()];
-        for i in 0..ids.len() {
+        let mut name: Vec<Key> = vec![NONE; cap];
+        for i in 0..cap {
+            if ids[i] == NONE {
+                continue;
+            }
             let r = find(&parent, i as u32) as usize;
             if name[r] == NONE || key_cmp(ids[i], name[r]) == Ordering::Less {
                 name[r] = ids[i];
             }
         }
-        (0..ids.len())
+        (0..cap)
             .filter_map(|i| {
+                if ids[i] == NONE {
+                    return None;
+                }
                 let r = find(&parent, i as u32) as usize;
                 if ids[i] != name[r] { Some((ids[i], name[r])) } else { None }
             })
             .collect()
     };
+    let nids = ids.iter().filter(|&&k| k != NONE).count();
     let links = LinkTable::new(&entries);
-    log(t0, &format!("links: {} ids, {} non-name", ids.len(), entries.len()));
+    log(t0, &format!("links: {} ids, {} non-name", nids, entries.len()));
     drop(entries);
     drop(parent);
     drop(ids);
+    drop(tk_store);
 
     // ---- events + clicks: one pass over every chunk, on `ncpu` threads
     let ev_chunks = chunks(&csv_files(&data.join("events")));
