@@ -1,11 +1,11 @@
 # STATUS: Shopping Sessions (resume from this file)
 
 Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.md` (strategy, phases, budget).
-Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always give the repo URL and the full commit SHA.** 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
+Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always give the repo URL and the full commit SHA.** 20 scored attempts total, max 3/hour (raised Sat afternoon). Never submit or create/push a public repo without the user's OK.
 
 **Scored so far: 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3) → 1.51 s (v3.1 1a1dbd2, best, position 180; Sat 13:30). Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
 
-## v3.2 (c5d7fff, pushed Sat 14:10): bucketed link table, ts day table, assists per (interval, day), SWAR digits. Native gates + 40 fuzz + 60M MATCH; amd64 Docker gate NOT run (OrbStack hung since ~13:58).
+## v3.2 (c5d7fff, pushed Sat 14:10): bucketed link table, ts day table, assists per (interval, day), SWAR digits. Native gates + 40 fuzz + 60M MATCH; amd64 Docker gate PASSED 18:05 (Docker recovered). 8-thread 20M user CPU: v2.4 5.8 s, v3.1 4.4 s, v3.2 3.85 s.
 Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse breakdown (M1, events): tokenizer 0.59, keys 0.37, ts 0.27, validation 0.25, resolve 0.28, scatter 0.1; base (links+clicks) 0.53; dedup 0.24; sessions 0.5.
 
 ## v3 (Sat 21 Nov afternoon): rewrite from the competitor-scan list
