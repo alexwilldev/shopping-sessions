@@ -3,6 +3,19 @@
 Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.md` (strategy, phases, budget).
 Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always give the repo URL and the full commit SHA.** 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
 
+**Scored so far (3 of 20 used): 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3, best). Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
+
+**Machine reserved for MACHINA-CAD from Sat 01:40 to ~08:00 (user-approved): no benchmarks, no Docker, no CPU claims, no big network transfers in that window.**
+**To beat 0.65 s, total CPU must fall ~4×: the remaining big cost is ~4 hash lookups per event (product, dedup, resolve, pid). Ideas: array lookup for structured IDs (p<digits>, c_<digits>) with a map fallback; fuse dedup with grouping; avoid the 64 B RawEv round trip.**
+
+## PAUSED 2026-11-20 22:25 (user prioritizing MECHROYALE, then BLAST-RADIUS). Resume heavy benchmarks only after Blast's Docker labelling finishes AND the user says so in this session (planned: Saturday morning, quiet machine). CLAIM on the ledger first.
+- Submitted by the user: #3 v2.1 `528424a`, #4 v2.2 `c8b6462`, #5 v2.3 `3b796af`. **Results pending: ask the user and fill in the submission log.**
+- Pushed HEAD = v2.3 `3b796af6ec40448c2ef61a1061b581ac5e4cbcea`.
+- (now committed in v2.4) progressive freeing (`transpose()` [chunk][bucket] → [bucket][chunk]; each bucket's records freed after use). Fixtures 36/36 and 20M match pass; not fuzzed; peak RSS unchanged (~5.2 GB, the peak is at the end of parsing). Backup of v2.3 source: scratchpad `main.rs.v23` (may be gone after reboot; `git diff` shows the change).
+- Quiet-host 20M: v2.3 ≈ 1.17–1.21 s, progressive-free ≈ 1.14 s. Stages: parse 0.55–0.66 s, dedup 0.25–0.33, sessions 0.25–0.30, write 0.06.
+- **Next (in order):** (1) DONE in v2.4. (2) dedup: a smaller win table (u64 hash → index, with full-key check). (3) parse: further per-line cuts (ts fast path, smaller RawEv). Gate each: fixtures, dev, 20M vs `out/h20-db`, `MEM=3g scripts/fuzz.sh shopping-sessions:v1 shopping-sessions:latest 30 <seed>`, arm64 + amd64 `check.sh`.
+- Shared board: claim released. Docker volumes `shop5m`, `shop20m` exist (VM timings at 20M are useless: 8 GB VM thrashes).
+
 ## Phase
 **Phase 2: Rust v2 READY (2026-11-20 20:55).** `rust/` (binary `shopsess`), root `Dockerfile` now builds it (`Dockerfile.polars` = v1). Gates: host 36/36 fixtures + exact dev match; Docker arm64 + amd64 `check.sh` PASSED; fuzz 30/30 seeds identical to v1; 20M output identical to v1/DuckDB. Host 20M: **4.5 s** (v1: 54 s); dev 0.29 s; peak RSS 5.4 GB. Docker 20M on the Mac: 11–14 s (dominated by OrbStack's /data file sharing, so use host timings).
 v1 practice result: **37.48 s, rank 68; leader 0.93 s** → v2 must get to ~1 s.
@@ -71,11 +84,13 @@ events parse ≈ 240 ns/line after the tokenizer (was 350). Remaining per-line c
 |---|---|---|---|---|---|---|
 | 1 | 11-20 ~20:30 | 9b66a08 | Polars v1 | passed | **37.48 s** (rank 68; 83 ms wait) | leader 0.93 s |
 | 2 | 11-20 ~21:00 | 98755db | Rust v2 | passed | **3.39 s** (rank 61; 60 ms wait) | |
-| 3 | slot 21:32 | 528424a | Rust v2.1 | local gates + fuzz 30/30 passed | pending | SWAR tokenizer, fast key_of, contiguous dedup, parallel user_daily write; 20M user CPU 12.6 → 8.7 s |
+| 3 | (never scored) | 528424a | Rust v2.1 | local gates + fuzz 30/30 passed | pending | SWAR tokenizer, fast key_of, contiguous dedup, parallel user_daily write; 20M user CPU 12.6 → 8.7 s |
 
-| 4 | next slot | v2.2 (HEAD at handover) | Rust v2.2 | all gates + fuzz 30/30 | pending | links concurrent with parsing; users resolved after dedup; Linux 5M user CPU 2.33 → 1.77 s |
+| 4 | (never scored) | c8b6462 | Rust v2.2 | all gates + fuzz 30/30 | pending | links concurrent with parsing; users resolved after dedup; Linux 5M user CPU 2.33 → 1.77 s |
 
-| 5 | next slot | v2.3 (HEAD at handover) | Rust v2.3 | all gates + fuzz 30/30 | pending | in-place dedup (no record copy), per-thread campaign arrays, NB=64; quiet host 20M 1.36–1.95 s vs v2.2 1.70–2.81 s |
+| 5 | 11-20 22:39 | 3b796af | Rust v2.3 | passed | **2.09 s** (best, entered in final; 20 ms wait) | in-place dedup (no record copy), per-thread campaign arrays, NB=64; quiet host 20M 1.36–1.95 s vs v2.2 1.70–2.81 s |
+
+| 6 | Sat slot | v2.4 (HEAD at handover) | Rust v2.4 | all gates + fuzz 30/30 | pending | sessions stage: person grouping via counting sort (sessions CPU −45%); records freed bucket by bucket. Expect ~1.9 s (≈ −8% CPU) |
 
 ## Local bench log (relative only)
 | Date | Impl | Dataset | Where | Wall time | Notes |

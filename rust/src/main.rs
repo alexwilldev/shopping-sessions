@@ -523,6 +523,18 @@ fn flush_row(row: &mut UserRow, rows: &mut Vec<UserRow>, catrev: &mut [i64], tou
     row.sessions = 0;
 }
 
+/// [chunk][bucket] -> [bucket][chunk], moving the inner Vecs (no element copies), so each
+/// bucket can be consumed (and freed) on its own.
+fn transpose<T>(parts: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
+    let mut by: Vec<Vec<Vec<T>>> = (0..NB).map(|_| Vec::with_capacity(parts.len())).collect();
+    for chunk in parts {
+        for (bi, v) in chunk.into_iter().enumerate() {
+            by[bi].push(v);
+        }
+    }
+    by
+}
+
 // ---------------------------------------------------------------- main
 
 fn main() {
@@ -723,21 +735,23 @@ fn main() {
         })
         .collect();
     drop(click_raw);
+    let click_parts = transpose(click_parts);
 
     // ---- per event_id bucket: dedup (smallest ingest_ts), validate the kept copy, drop late,
     // re-bucket by person
-    let ev_by_person: Vec<Vec<Vec<Ev>>> = (0..NB)
+    let ev_parts = transpose(ev_parts);
+    let ev_by_person: Vec<Vec<Vec<Ev>>> = ev_parts
         .into_par_iter()
-        .map(|bi| {
-            let n: usize = ev_parts.iter().map(|p| p[bi].len()).sum();
+        .map(|parts| {
+            let n: usize = parts.iter().map(|p| p.len()).sum();
             // Dedup in place over the per-chunk slices (no copy of the 64 B records):
             // `win` maps event_id -> (ingest, part, row) of the copy kept so far; `lose`
             // marks the copies that lost (a later or equal ingest_ts).
-            let mut lose: Vec<Vec<bool>> = ev_parts.iter().map(|p| vec![false; p[bi].len()]).collect();
+            let mut lose: Vec<Vec<bool>> = parts.iter().map(|p| vec![false; p.len()]).collect();
             let mut win: FxHashMap<Key, (i64, u32, u32)> = FxHashMap::default();
             win.reserve(n);
-            for (pi, p) in ev_parts.iter().enumerate() {
-                for (ri, r) in p[bi].iter().enumerate() {
+            for (pi, p) in parts.iter().enumerate() {
+                for (ri, r) in p.iter().enumerate() {
                     match win.entry(r.eid) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert((r.ingest, pi as u32, ri as u32));
@@ -757,10 +771,10 @@ fn main() {
             drop(win);
             let per = n / NB + n / NB / 4 + 8;
             let mut out: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(per)).collect();
-            for (r, _) in ev_parts
+            for (r, _) in parts
                 .iter()
                 .zip(lose.iter())
-                .flat_map(|(p, l)| p[bi].iter().zip(l.iter()))
+                .flat_map(|(p, l)| p.iter().zip(l.iter()))
                 .filter(|(_, l)| !**l)
             {
                 if r.user == NONE
@@ -783,10 +797,11 @@ fn main() {
                     purchase: r.etype == 3,
                 });
             }
+            drop(parts); // free this bucket's raw records now
             out
         })
         .collect();
-    drop(ev_parts);
+    let ev_by_person = transpose(ev_by_person);
     log(t0, "events deduped and validated");
 
     // ---- per person bucket: sessions, credit, assists, aggregates.
@@ -794,41 +809,107 @@ fn main() {
     // Campaign stats accumulate per rayon split (about one array per thread), not per bucket.
     type Acc = (Vec<(usize, Vec<UserRow>)>, Vec<[i64; 4]>);
     let new_acc = || -> Acc { (Vec::new(), vec![[0i64; 4]; ncamp * nd]) };
-    let (mut results, camp): Acc = (0..NB)
+    let (mut results, camp): Acc = ev_by_person
         .into_par_iter()
-        .fold(new_acc, |(mut rv, mut camp), pb| {
-            let mut evs: Vec<Ev> = Vec::with_capacity(ev_by_person.iter().map(|p| p[pb].len()).sum());
-            for p in &ev_by_person {
-                evs.extend_from_slice(&p[pb]);
+        .zip(click_parts.into_par_iter())
+        .enumerate()
+        .fold(new_acc, |(mut rv, mut camp), (pb, (eparts, cparts))| {
+            let mut evs: Vec<Ev> = Vec::with_capacity(eparts.iter().map(|p| p.len()).sum());
+            for p in eparts {
+                evs.extend_from_slice(&p); // each source Vec is freed right after its copy
             }
-            let mut cks: Vec<Click> = Vec::new();
-            for p in &click_parts {
-                cks.extend_from_slice(&p[pb]);
+            let mut cks: Vec<Click> = Vec::with_capacity(cparts.iter().map(|p| p.len()).sum());
+            for p in cparts {
+                cks.extend_from_slice(&p);
             }
-            // One sort decides session order: equal timestamps are adjacent, so a tie never
-            // starts a session (its gap is 0) whatever order the tied events come in.
-            evs.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-            cks.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| key_cmp(a.cid, b.cid)));
+            // Group by person with a counting sort on local person ids (no global comparison
+            // sort on the 128-bit key), then sort each person's events by ts. Equal timestamps
+            // are adjacent, so a tie never starts a session whatever order ties come in.
+            let mut pid_of: FxHashMap<Key, u32> = FxHashMap::default();
+            pid_of.reserve(evs.len() / 8 + 16);
+            let mut persons: Vec<Key> = Vec::new();
+            let mut eoff: Vec<u32> = Vec::new();
+            let epid: Vec<u32> = evs
+                .iter()
+                .map(|e| {
+                    let p = *pid_of.entry(e.person).or_insert_with(|| {
+                        persons.push(e.person);
+                        eoff.push(0);
+                        (persons.len() - 1) as u32
+                    });
+                    eoff[p as usize] += 1;
+                    p
+                })
+                .collect();
+            let np = persons.len();
+            let mut acc = 0u32;
+            for c in eoff.iter_mut() {
+                let n = *c;
+                *c = acc;
+                acc += n;
+            }
+            eoff.push(acc);
+            let mut grouped: Vec<Ev> = Vec::with_capacity(evs.len());
+            unsafe { grouped.set_len(evs.len()) };
+            {
+                let mut pos: Vec<u32> = eoff[..np].to_vec();
+                for (e, &p) in evs.iter().zip(epid.iter()) {
+                    grouped[pos[p as usize] as usize] = *e;
+                    pos[p as usize] += 1;
+                }
+            }
+            drop(evs);
+            drop(epid);
+            for p in 0..np {
+                grouped[eoff[p] as usize..eoff[p + 1] as usize].sort_unstable_by_key(|e| e.ts);
+            }
+            let evs = grouped;
+            // clicks: only persons with events matter (others can't credit or assist anything)
+            let mut coff: Vec<u32> = vec![0; np + 1];
+            let cpid: Vec<u32> = cks
+                .iter()
+                .map(|c| match pid_of.get(&c.person) {
+                    Some(&p) => {
+                        coff[p as usize] += 1;
+                        p
+                    }
+                    None => u32::MAX,
+                })
+                .collect();
+            let mut acc = 0u32;
+            for c in coff.iter_mut() {
+                let n = *c;
+                *c = acc;
+                acc += n;
+            }
+            let mut cgrouped: Vec<Click> = Vec::with_capacity(acc as usize);
+            unsafe { cgrouped.set_len(acc as usize) };
+            {
+                let mut pos: Vec<u32> = coff[..np].to_vec();
+                for (c, &p) in cks.iter().zip(cpid.iter()) {
+                    if p != u32::MAX {
+                        cgrouped[pos[p as usize] as usize] = *c;
+                        pos[p as usize] += 1;
+                    }
+                }
+            }
+            drop(cks);
+            drop(cpid);
+            drop(pid_of);
+            for p in 0..np {
+                cgrouped[coff[p] as usize..coff[p + 1] as usize]
+                    .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key_cmp(a.cid, b.cid)));
+            }
+            let cks = cgrouped;
             let mut rows: Vec<UserRow> = Vec::new();
             let mut catrev = vec![0i64; ncat];
             let mut touched: Vec<u16> = Vec::new();
             let mut starts: Vec<i64> = Vec::new();
             let mut ccamp: Vec<(u16, i64)> = Vec::new();
-            let (mut i, mut j) = (0usize, 0usize);
-            while i < evs.len() {
-                let person = evs[i].person;
-                let mut iend = i;
-                while iend < evs.len() && evs[iend].person == person {
-                    iend += 1;
-                }
-                while j < cks.len() && cks[j].person < person {
-                    j += 1;
-                }
-                let mut jend = j;
-                while jend < cks.len() && cks[jend].person == person {
-                    jend += 1;
-                }
-                let pc = &cks[j..jend];
+            for p in 0..np {
+                let person = persons[p];
+                let (i, iend) = (eoff[p] as usize, eoff[p + 1] as usize);
+                let pc = &cks[coff[p] as usize..coff[p + 1] as usize];
                 starts.clear();
                 let mut row = UserRow { person, day: i32::MIN, sessions: 0, events: 0, revenue: 0, top: None };
                 let mut k = i;
@@ -900,8 +981,6 @@ fn main() {
                         a = b;
                     }
                 }
-                i = iend;
-                j = jend;
             }
             rv.push((pb, rows));
             (rv, camp)
@@ -916,8 +995,6 @@ fn main() {
             (ra, ca)
         });
     results.sort_unstable_by_key(|(pb, _)| *pb);
-    drop(ev_by_person);
-    drop(click_parts);
     log(t0, "sessions and attribution done");
 
     // ---- merge campaign stats, write outputs
