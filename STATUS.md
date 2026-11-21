@@ -5,6 +5,8 @@ Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always gi
 
 **Scored so far: 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3) → 1.51 s (v3.1 1a1dbd2, best, position 180; Sat 13:30). Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
 
+## v3.3 (Sat ~18:45): SIMD ID packing (NEON/SSE4.1), lock-free intern table for links, tokenizer fast path (blocks whose quotes all sit at field edges). Single-thread 20M CPU 3.10 -> 2.81 s vs v3.2. Gates: unit tests on arm64 AND x86 (Rosetta, x86-64-v3: `RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release --target x86_64-apple-darwin`), hostcheck with the x86 binary (BIN=rust/target/x86_64-apple-darwin/release/shopsess), 40 fuzz, long-ID test. Docker amd64 gate not run (MACHINA-CAD attempt 1 has the machine; <=2 cores).
+
 ## v3.2 (c5d7fff, pushed Sat 14:10): bucketed link table, ts day table, assists per (interval, day), SWAR digits. Native gates + 40 fuzz + 60M MATCH; amd64 Docker gate PASSED 18:05 (Docker recovered). 8-thread 20M user CPU: v2.4 5.8 s, v3.1 4.4 s, v3.2 3.85 s.
 Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse breakdown (M1, events): tokenizer 0.59, keys 0.37, ts 0.27, validation 0.25, resolve 0.28, scatter 0.1; base (links+clicks) 0.53; dedup 0.24; sessions 0.5.
 

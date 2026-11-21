@@ -90,22 +90,12 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [
     let mut bad = false;
     let mut qbase = 0u64; // quotes before the current block
 
-    let mut b = 0usize;
-    let mut tail = [0u8; 64];
-    while b < len {
-        let (comma, nlm, quote) = if b + 64 <= len {
-            block_masks(unsafe { base.add(b) })
-        } else {
-            tail[..len - b].copy_from_slice(&data[b..]);
-            block_masks(tail.as_ptr())
-        };
-        let mut sep = comma | nlm;
-        while sep != 0 {
-            let i = sep.trailing_zeros();
-            sep &= sep - 1;
-            let p = b + i as usize; // p < len: a separator byte
-            let qp = qbase + (quote & ((1u64 << i) - 1)).count_ones() as u64;
-            // branch-free field: [fs, p), quotes allowed only as `"..."`
+    // Exact handling of one separator at block offset i (quote counts by prefix popcount).
+    macro_rules! exact {
+        ($b:expr, $i:expr, $quote:expr, $nlm:expr) => {{
+            let i: u32 = $i;
+            let p = $b + i as usize; // p < len: a separator byte
+            let qp = qbase + ($quote & ((1u64 << i) - 1)).count_ones() as u64;
             let qc = qp - qstart;
             let l = p - fs;
             let (first, last) = unsafe { (*base.add(fs), *base.add(p.max(1) - 1)) };
@@ -118,15 +108,85 @@ pub fn for_records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [
             n += 1;
             fs = p + 1;
             qstart = qp;
-            if (nlm >> i) & 1 != 0 {
+            if ($nlm >> i) & 1 != 0 {
                 if !bad && n == N {
                     f(unsafe { &*(fields.as_ptr() as *const [&'a [u8]; N]) });
                 }
                 n = 0;
                 bad = false;
             }
+        }};
+    }
+
+    let mut b = 0usize;
+    let mut tail = [0u8; 64];
+    while b < len {
+        if b + 64 < len {
+            let (comma, nlm, quote) = block_masks(unsafe { base.add(b) });
+            let seps = comma | nlm;
+            let is_sep = |c: u8| ((c == b',') | (c == b'\n')) as u64;
+            let prev = if b == 0 { 1 } else { is_sep(unsafe { *base.add(b - 1) }) };
+            let next = is_sep(unsafe { *base.add(b + 64) });
+            let starts = (seps << 1) | prev;
+            let ends = (seps >> 1) | (next << 63);
+            let mut sep = seps;
+            if quote & !(starts | ends) == 0 {
+                // Fast block: every quote is at a field start or end, so a field is valid iff
+                // it is unquoted or is `"..."` (first and last byte quotes, length >= 2).
+                if fs < b && sep != 0 {
+                    // the first field started in an earlier block: exact check
+                    let i = sep.trailing_zeros();
+                    sep &= sep - 1;
+                    exact!(b, i, quote, nlm);
+                }
+                while sep != 0 {
+                    let i = sep.trailing_zeros();
+                    sep &= sep - 1;
+                    let p = b + i as usize;
+                    let l = p - fs;
+                    let (first, last) = unsafe { (*base.add(fs), *base.add(p.max(1) - 1)) };
+                    let sq = first == b'"';
+                    let eq = last == b'"';
+                    bad |= (sq != eq) | (sq & (l < 2));
+                    let strip = sq as usize;
+                    let fl = l.wrapping_sub(2 * strip);
+                    let fl = if fl > l { 0 } else { fl };
+                    fields[n.min(7)] = unsafe { std::slice::from_raw_parts(base.add(fs + strip), fl) };
+                    n += 1;
+                    fs = p + 1;
+                    if (nlm >> i) & 1 != 0 {
+                        if !bad && n == N {
+                            f(unsafe { &*(fields.as_ptr() as *const [&'a [u8]; N]) });
+                        }
+                        n = 0;
+                        bad = false;
+                    }
+                }
+                // keep qstart (quotes before fs) exact for the slow path
+                if fs >= b {
+                    let k = fs - b; // 0..=64
+                    let low = if k >= 64 { quote } else { quote & ((1u64 << k) - 1) };
+                    qstart = qbase + low.count_ones() as u64;
+                }
+            } else {
+                while sep != 0 {
+                    let i = sep.trailing_zeros();
+                    sep &= sep - 1;
+                    exact!(b, i, quote, nlm);
+                }
+            }
+            qbase += quote.count_ones() as u64;
+        } else {
+            tail[..len - b].copy_from_slice(&data[b..]);
+            let (comma, nlm, quote) = block_masks(tail.as_ptr());
+            let mut sep = comma | nlm;
+            while sep != 0 {
+                let i = sep.trailing_zeros();
+                sep &= sep - 1;
+                exact!(b, i, quote, nlm);
+            }
+            qbase += quote.count_ones() as u64;
         }
-        qbase += quote.count_ones() as u64;
         b += 64;
     }
     if fs < len || n > 0 {
@@ -184,10 +244,46 @@ mod tests {
     }
 
     #[test]
+    fn structured_lines_match_reference() {
+        let kinds: [&[u8]; 9] = [b"abc", b"x", b"", b"\"q\"", b"\"\"", b"\"", b"\"ab", b"a\"b", b"\"longer quoted value\""];
+        let mut s = 0xdead_beef_1234_5678u64;
+        for _ in 0..20000 {
+            let mut d = Vec::new();
+            for _ in 0..(s % 9) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let nf = 2 + (s % 3);
+                for j in 0..nf {
+                    let r = (s >> (4 + 6 * j)) as usize;
+                    // mostly valid kinds, sometimes malformed ones
+                    let k = if r % 11 == 0 { kinds[5 + (r / 11) % 3] } else { kinds[[0, 1, 2, 3, 4, 8][(r / 11) % 6]] };
+                    if j > 0 {
+                        d.push(b',');
+                    }
+                    d.extend_from_slice(k);
+                    for _ in 0..((r >> 8) % 20) {
+                        if k.is_empty() || k[0] != b'"' {
+                            d.push(b'z');
+                        }
+                    }
+                }
+                if (s >> 61) != 0 {
+                    d.push(b'\n');
+                }
+            }
+            let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+            super::for_records::<3>(&d, |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
+            assert_eq!(got, reference::<3>(&d), "{:?}", String::from_utf8_lossy(&d));
+        }
+    }
+
+    #[test]
     fn matches_reference() {
-        let alphabet = b",,,\n\n\"\"ab\r 1";
+        let alphabets: [&[u8]; 3] = [b",,,\n\n\"\"ab\r 1", b",,,,\nabcdefghij0123456789\"", b",,\nxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz\""];
         let mut s = 0x1234_5678_9abc_def0u64;
-        for round in 0..3000 {
+        for round in 0..30000 {
+            let alphabet = alphabets[round % 3];
             let len = (round * 7) % 400;
             let mut d = Vec::with_capacity(len);
             for _ in 0..len {
