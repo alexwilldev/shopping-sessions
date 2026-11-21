@@ -4,7 +4,7 @@ Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.m
 Cutoff: **Sun 2026-11-22 11:00 ET**. 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
 
 ## Phase
-**Phase 1: v1 READY TO SUBMIT (2026-11-20 20:25).** Polars v1: `make check` PASSED on arm64 and amd64 (36/36 fixtures + exact dev match, even at MEM=3g). 20M output matches DuckDB exactly. Waiting on the user: create the `shopping-sessions` repo, push, submit #1.
+**Phase 1: v1 READY TO SUBMIT (2026-11-20 20:25).** Polars v1: `make check` PASSED on arm64 and amd64 (36/36 fixtures + exact dev match, even at MEM=3g). 20M output matches DuckDB exactly. Repo **https://github.com/alexwilldev/shopping-sessions** (public, `main`) pushed 2026-11-20. **The user submits #1 themselves** (commit `9b66a084e46543bdf4efae2ad5910b8dbd7682df`). Ask the user for the result and log it below.
 
 ## Shared machine (4 tracks on this Mac)
 - Message board: `~/Developer/hackathon/DISK_LEDGER.md`. **Check it regularly (user's instruction).** Our tag is `SHOPPING`. CLAIM any job that uses >2 GB disk, >4 GB RAM, or >4 cores for more than 10 min. Edit only our own rows.
@@ -38,7 +38,7 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 - DuckDB common-subexpression elimination evaluated `CAST`s outside their guarding `CASE` (E18 crash) → use `TRY_CAST`.
 
 ## Next 3 tasks
-1. With the user's OK: `gh repo create shopping-sessions --public --source . --push`, then submit the commit SHA on the track page. Log it below.
+1. Get submission #1's result from the user (dev check + practice time) and log it below. Keep every submitted commit in the public repo.
 2. Start Phase 2 (Rust v2) in `rust/`, with `make fuzz REF=<polars image>` as the gate. Design for low memory: no full copies of the string columns, interned u32 IDs.
 3. Bench v2 on 20M/60M, CLAIMing on the ledger for runs over 10 min.
 
@@ -57,6 +57,7 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 ## Submission log
 | # | Time (ET) | Commit | Impl | Dev check | Practice time | Notes |
 |---|---|---|---|---|---|---|
+| 1 | 11-20 ~20:30 (user submitting) | 9b66a08 | Polars v1 | local gate passed | pending | first correct version; ties go to earliest |
 
 ## Local bench log (relative only)
 | Date | Impl | Dataset | Where | Wall time | Notes |
