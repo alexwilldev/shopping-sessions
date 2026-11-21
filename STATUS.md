@@ -3,7 +3,7 @@
 Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.md` (strategy, phases, budget).
 Cutoff: **Sun 2026-11-22 11:00 ET**. **When asking the user to submit, always give the repo URL and the full commit SHA.** 20 scored attempts total, max 3/hour (raised Sat afternoon). Never submit or create/push a public repo without the user's OK.
 
-**Scored so far: 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3) → 1.51 s (v3.1 1a1dbd2, best, position 180; Sat 13:30). Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
+**Scored so far: 37.48 s (v1) → 3.39 s (v2) → 2.09 s (v2.3) → 1.51 s (v3.1 1a1dbd2, position 180; Sat 13:30) → 1.40 s (v3.3 b910dc1, best; Sat 18:19, wait 205 ms). NOTE: CPU fell ~25% v3.1->v3.3 but score only ~7%: a large fixed/serial part on the scorer. Probe branch `probe` (sleeps 9x own time) to measure in-process T. Leader 0.65 s (Sat 00:15). Quiet M1 host → scorer ratio ≈ 1.75× (1.2 s → 2.09 s), so beating 0.65 s needs ≈ 0.37 s on the host for 20M.**
 
 ## v3.3 (Sat ~18:45): SIMD ID packing (NEON/SSE4.1), lock-free intern table for links, tokenizer fast path (blocks whose quotes all sit at field edges). Single-thread 20M CPU 3.10 -> 2.81 s vs v3.2. Gates: unit tests on arm64 AND x86 (Rosetta, x86-64-v3: `RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release --target x86_64-apple-darwin`), hostcheck with the x86 binary (BIN=rust/target/x86_64-apple-darwin/release/shopsess), 40 fuzz, long-ID test. Docker amd64 gate not run (MACHINA-CAD attempt 1 has the machine; <=2 cores).
 
