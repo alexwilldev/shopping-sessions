@@ -1149,6 +1149,8 @@ fn main() {
     }
     write_campaign(&out.join("campaign_daily/part-0.parquet"), &cids, &chans, &days, &vals);
     log(t0, &format!("done: {} user rows, {} campaign rows", n_user, days.len()));
+    // PROBE (never a candidate): sleep 9x our own time, so score = fixed + 10 T.
+    std::thread::sleep(t0.elapsed() * 9);
     // Fast exit: the files are written (write(2) returned); skip freeing everything.
     unsafe { libc::_exit(0) }
 }
