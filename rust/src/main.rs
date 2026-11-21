@@ -436,8 +436,8 @@ fn small_csv<const N: usize>(path: &Path, mut f: impl FnMut(&[&[u8]; N])) {
 #[derive(Clone, Copy)]
 struct RawEv {
     eid: Key,
-    person: Key, // NONE if user_id empty
-    ts: i64,     // i64::MIN if bad
+    user: Key, // raw user_id key, NONE if empty (resolved to a person after dedup)
+    ts: i64,   // i64::MIN if bad
     ingest: i64,
     price: i32, // -1 if not a valid purchase price
     cat: u16,   // u16::MAX if product_id empty
@@ -451,6 +451,14 @@ struct Ev {
     price: i32, // purchase price, 0 for view/cart
     cat: u16,
     purchase: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RawClick {
+    user: Key,
+    ts: i64,
+    cid: Key,
+    camp: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -472,7 +480,17 @@ struct UserRow {
 }
 
 fn log(t0: Instant, msg: &str) {
-    eprintln!("[{:7.3}s] {}", t0.elapsed().as_secs_f64(), msg);
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let cpu = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    eprintln!(
+        "[{:7.3}s] {}  (user {:.2}s sys {:.2}s minflt {})",
+        t0.elapsed().as_secs_f64(),
+        msg,
+        cpu(ru.ru_utime),
+        cpu(ru.ru_stime),
+        ru.ru_minflt
+    );
 }
 
 fn manifest_ts(text: &str, key: &str) -> i64 {
@@ -559,7 +577,10 @@ fn main() {
     let ncamp = camp_ids.len() + 1;
     log(t0, &format!("products {} categories {} campaigns {}", product_cat.len(), ncat, ncamp - 1));
 
-    // ---- links -> iterative union-find -> person name (byte-wise smallest ID) per linked ID
+    // ---- links -> iterative union-find -> person name (byte-wise smallest ID) per linked ID.
+    // Runs concurrently with event/click parsing; only IDs whose person differs from
+    // themselves are stored (resolve() falls back to the ID itself).
+    let build_links = || -> FxHashMap<Key, Key> {
     let link_chunks = chunks(&csv_files(&data.join("links")));
     let pairs: Vec<(Key, Key)> = link_chunks
         .par_iter()
@@ -613,22 +634,23 @@ fn main() {
     person_of.reserve(ids.len());
     for i in 0..ids.len() as u32 {
         let r = find(&mut parent, i) as usize;
-        person_of.insert(ids[i as usize], root_min[r]);
+        if ids[i as usize] != root_min[r] {
+            person_of.insert(ids[i as usize], root_min[r]);
+        }
     }
-    log(t0, &format!("links: {} ids", ids.len()));
-    drop((ids, parent, root_min));
-    let resolve = |user: Key| -> Key {
-        if user == NONE { NONE } else { *person_of.get(&user).unwrap_or(&user) }
+    log(t0, &format!("links: {} ids, {} non-name", ids.len(), person_of.len()));
+    person_of
     };
 
     // ---- clicks: parse + validate, bucket by person. No dedup needed: copies are identical,
     // and a duplicate never changes the latest-click choice or the set of assisting campaigns.
     let click_chunks = chunks(&csv_files(&data.join("clicks")));
     let cmin = ws - WEEK;
-    let click_parts: Vec<Vec<Vec<Click>>> = click_chunks
+    let parse_clicks = || -> Vec<Vec<RawClick>> {
+        click_chunks
         .par_iter()
         .map(|c| {
-            let mut b: Vec<Vec<Click>> = (0..NB).map(|_| Vec::new()).collect();
+            let mut b: Vec<RawClick> = Vec::with_capacity((c.end - c.start) / 45 + 8);
             for_records::<4>(c, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -638,17 +660,17 @@ fn main() {
                 if ts < cmin || ts >= we {
                     return;
                 }
-                let person = resolve(key_of(f[1]));
-                b[bucket(person)].push(Click { person, ts, cid: key_of(f[0]), camp });
+                b.push(RawClick { user: key_of(f[1]), ts, cid: key_of(f[0]), camp });
             });
             b
         })
-        .collect();
-    log(t0, "clicks parsed");
+        .collect()
+    };
 
     // ---- events: parse, bucket by event_id
     let ev_chunks = chunks(&csv_files(&data.join("events")));
-    let ev_parts: Vec<Vec<Vec<RawEv>>> = ev_chunks
+    let parse_events = || -> Vec<Vec<Vec<RawEv>>> {
+        ev_chunks
         .par_iter()
         .map(|c| {
             // ~75 bytes per event line; pre-size so the buckets rarely reallocate
@@ -669,7 +691,7 @@ fn main() {
                 let cat = if f[5].is_empty() { u16::MAX } else { *product_cat.get(&key_of(f[5])).unwrap_or(&unknown) };
                 b[bucket(eid)].push(RawEv {
                     eid,
-                    person: resolve(key_of(f[1])),
+                    user: key_of(f[1]),
                     ts: parse_ts(f[2]).unwrap_or(i64::MIN),
                     ingest: parse_ts(f[3]).unwrap_or(i64::MAX),
                     price,
@@ -679,8 +701,28 @@ fn main() {
             });
             b
         })
+        .collect()
+    };
+
+    // links || events || clicks, then resolve users to persons
+    let (person_of, (ev_parts, click_raw)) =
+        rayon::join(build_links, || rayon::join(parse_events, parse_clicks));
+    log(t0, "links, events and clicks parsed");
+    let resolve = |user: Key| -> Key {
+        if user == NONE { NONE } else { *person_of.get(&user).unwrap_or(&user) }
+    };
+    let click_parts: Vec<Vec<Vec<Click>>> = click_raw
+        .par_iter()
+        .map(|v| {
+            let mut b: Vec<Vec<Click>> = (0..NB).map(|_| Vec::new()).collect();
+            for r in v {
+                let person = resolve(r.user);
+                b[bucket(person)].push(Click { person, ts: r.ts, cid: r.cid, camp: r.camp });
+            }
+            b
+        })
         .collect();
-    log(t0, "events parsed");
+    drop(click_raw);
 
     // ---- per event_id bucket: dedup (smallest ingest_ts), validate the kept copy, drop late,
     // re-bucket by person
@@ -716,7 +758,7 @@ fn main() {
             let per = n / NB + n / NB / 4 + 8;
             let mut out: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(per)).collect();
             for (r, _) in recs.iter().zip(keep.iter()).filter(|(_, k)| **k) {
-                if r.person == NONE
+                if r.user == NONE
                     || r.ts == i64::MIN
                     || r.ts < ws
                     || r.ts >= we
@@ -727,8 +769,9 @@ fn main() {
                 {
                     continue;
                 }
-                out[bucket(r.person)].push(Ev {
-                    person: r.person,
+                let person = resolve(r.user);
+                out[bucket(person)].push(Ev {
+                    person,
                     ts: r.ts,
                     price: if r.etype == 3 { r.price } else { 0 },
                     cat: r.cat,
