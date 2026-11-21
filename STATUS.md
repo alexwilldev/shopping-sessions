@@ -41,6 +41,8 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 - DuckDB common-subexpression elimination evaluated `CAST`s outside their guarding `CASE` (E18 crash) → use `TRY_CAST`.
 
 ## Next 3 tasks (Phase 3: optimize v2)
+Profiling notes (single-thread on cached `data/gen5m`, the reliable local metric; 20M wall time on this loaded Mac is I/O-noisy):
+events parse ≈ 240 ns/line after the tokenizer (was 350). Remaining per-line costs: key packing, 2× parse_ts (~100 ns), resolve() map lookup on 1.2M IDs + product map (~90 ns), the 64 B RawEv push into 256 buckets. sys time 2.5–3.5 s = page faults from fresh allocations.
 1. Profile v2 stages on 20M on the host: events parse is ~2 s of 4.5 s. Targets: SIMD/memchr line + comma scan, avoid the 64 B RawEv (dedup with a compact table), pre-size bucket vecs, fewer than 256 buckets × chunks Vecs, faster hash (FxHash on u128).
 2. Cut memory (5.4 GB at 20M → ~16 GB at 60M is risky): smaller records, free stage outputs early.
 3. Each candidate: fixtures + dev + fuzz (`MEM=3g CPUS=4 scripts/fuzz.sh shopping-sessions:v1 shopping-sessions:latest 30`), then submit if the host gain is >10%.
@@ -66,7 +68,8 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 | # | Time (ET) | Commit | Impl | Dev check | Practice time | Notes |
 |---|---|---|---|---|---|---|
 | 1 | 11-20 ~20:30 | 9b66a08 | Polars v1 | passed | **37.48 s** (rank 68; 83 ms wait) | leader 0.93 s |
-| 2 | (pending) | see git log | Rust v2 | local gates passed | pending | host 20M 4.5 s |
+| 2 | 11-20 ~21:00 | 98755db | Rust v2 | passed | **3.39 s** (rank 61; 60 ms wait) | |
+| 3 | slot 21:32 | 23383b3 (+STATUS-only commit after) | Rust v2.1 | local gates + fuzz 30/30 passed | pending | SWAR tokenizer, fast key_of, contiguous dedup, parallel user_daily write; 20M user CPU 12.6 → 8.7 s |
 
 ## Local bench log (relative only)
 | Date | Impl | Dataset | Where | Wall time | Notes |
