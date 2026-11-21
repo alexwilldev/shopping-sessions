@@ -16,16 +16,14 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::parser::parse_message_type;
+mod pq;
+
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
@@ -1038,101 +1036,60 @@ fn main() {
     }
     write_campaign(&out.join("campaign_daily/part-0.parquet"), &cids, &chans, &days, &vals);
     log(t0, &format!("done: {} user rows, {} campaign rows", n_user, days.len()));
+    // Fast exit: the files are written (write(2) returned); skip freeing everything.
+    unsafe { libc::_exit(0) }
 }
 
 // ---------------------------------------------------------------- parquet
 
-fn props() -> Arc<WriterProperties> {
-    Arc::new(WriterProperties::builder().set_dictionary_enabled(false).build())
+/// Appends the ID behind a key as one PLAIN BYTE_ARRAY value.
+fn push_key(plain: &mut Vec<u8>, k: Key) {
+    if is_long(k) {
+        pq::push_str(plain, &key_bytes(k));
+    } else {
+        let b = k.to_be_bytes();
+        pq::push_str(plain, &b[..b[15] as usize]);
+    }
 }
 
 fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>]) {
-    let schema = Arc::new(
-        parse_message_type(
-            "message user_daily {
-                required binary user_id (STRING);
-                required int32 day (DATE);
-                required int64 sessions;
-                required int64 events;
-                required int64 revenue_cents;
-                optional binary top_category (STRING);
-            }",
-        )
-        .unwrap(),
-    );
-    let mut w = SerializedFileWriter::new(File::create(path).unwrap(), schema, props()).unwrap();
-    let mut rg = w.next_row_group().unwrap();
-    let mut col = 0;
-    while let Some(mut c) = rg.next_column().unwrap() {
-        match col {
-            0 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(key_bytes(r.person))).collect();
-                c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
-            }
-            1 => {
-                let v: Vec<i32> = rows.iter().map(|r| r.day).collect();
-                c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
-            }
-            2..=4 => {
-                let v: Vec<i64> = rows
-                    .iter()
-                    .map(|r| match col {
-                        2 => r.sessions,
-                        3 => r.events,
-                        _ => r.revenue,
-                    })
-                    .collect();
-                c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
-            }
-            _ => {
-                let defs: Vec<i16> = rows.iter().map(|r| r.top.is_some() as i16).collect();
-                let v: Vec<ByteArray> =
-                    rows.iter().filter_map(|r| r.top.map(|t| ByteArray::from(cats[t as usize].clone()))).collect();
-                c.typed::<ByteArrayType>().write_batch(&v, Some(&defs), None).unwrap();
-            }
+    let mut ids = Vec::with_capacity(rows.len() * 14);
+    let mut top = Vec::with_capacity(rows.len() * 12);
+    let mut present = Vec::with_capacity(rows.len());
+    for r in rows {
+        push_key(&mut ids, r.person);
+        if let Some(t) = r.top {
+            pq::push_str(&mut top, &cats[t as usize]);
         }
-        c.close().unwrap();
-        col += 1;
+        present.push(r.top.is_some());
     }
-    rg.close().unwrap();
-    w.close().unwrap();
+    let cols = [
+        pq::Col::Str { name: "user_id", optional: false, plain: ids, present: None },
+        pq::Col::I32 { name: "day", date: true, v: rows.iter().map(|r| r.day).collect() },
+        pq::Col::I32 { name: "sessions", date: false, v: rows.iter().map(|r| r.sessions as i32).collect() },
+        pq::Col::I32 { name: "events", date: false, v: rows.iter().map(|r| r.events as i32).collect() },
+        pq::Col::I64 { name: "revenue_cents", v: rows.iter().map(|r| r.revenue).collect() },
+        pq::Col::Str { name: "top_category", optional: true, plain: top, present: Some(present) },
+    ];
+    pq::write(path, "user_daily", rows.len(), &cols);
 }
 
 fn write_campaign(path: &Path, cids: &[Vec<u8>], chans: &[Vec<u8>], days: &[i32], vals: &[Vec<i64>; 4]) {
-    let schema = Arc::new(
-        parse_message_type(
-            "message campaign_daily {
-                required binary campaign_id (STRING);
-                required binary channel (STRING);
-                required int32 day (DATE);
-                required int64 sessions;
-                required int64 purchasing_sessions;
-                required int64 revenue_cents;
-                required int64 assisted_sessions;
-            }",
-        )
-        .unwrap(),
-    );
-    let mut w = SerializedFileWriter::new(File::create(path).unwrap(), schema, props()).unwrap();
-    let mut rg = w.next_row_group().unwrap();
-    let mut col = 0;
-    while let Some(mut c) = rg.next_column().unwrap() {
-        match col {
-            0 | 1 => {
-                let src = if col == 0 { cids } else { chans };
-                let v: Vec<ByteArray> = src.iter().map(|b| ByteArray::from(b.clone())).collect();
-                c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
-            }
-            2 => {
-                c.typed::<Int32Type>().write_batch(days, None, None).unwrap();
-            }
-            _ => {
-                c.typed::<Int64Type>().write_batch(&vals[col - 3], None, None).unwrap();
-            }
+    let strs = |src: &[Vec<u8>]| {
+        let mut p = Vec::new();
+        for b in src {
+            pq::push_str(&mut p, b);
         }
-        c.close().unwrap();
-        col += 1;
-    }
-    rg.close().unwrap();
-    w.close().unwrap();
+        p
+    };
+    let cols = [
+        pq::Col::Str { name: "campaign_id", optional: false, plain: strs(cids), present: None },
+        pq::Col::Str { name: "channel", optional: false, plain: strs(chans), present: None },
+        pq::Col::I32 { name: "day", date: true, v: days.to_vec() },
+        pq::Col::I64 { name: "sessions", v: vals[0].clone() },
+        pq::Col::I64 { name: "purchasing_sessions", v: vals[1].clone() },
+        pq::Col::I64 { name: "revenue_cents", v: vals[2].clone() },
+        pq::Col::I64 { name: "assisted_sessions", v: vals[3].clone() },
+    ];
+    pq::write(path, "campaign_daily", days.len(), &cols);
 }
