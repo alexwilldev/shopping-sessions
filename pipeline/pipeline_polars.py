@@ -40,14 +40,34 @@ def uq(e):
     return pl.when(v == "").then(None).otherwise(v)
 
 
-def parse(path, names):
-    """LazyFrame of the well-formed lines of the CSV file(s), fields unquoted, empty -> null."""
-    lines = pl.from_arrow(read_lines(path, NCPU)).lazy()
+def _parse_lazy(lines, names):
     pat = "^" + ",".join(f"(?P<{n}>{FIELD[1:-1]})" for n in names) + "\n$"
     return (lines.select(pl.col("line").str.extract_groups(pat).alias("m"))
             .unnest("m")
             .filter(pl.col(names[0]).is_not_null())  # no match -> all groups null
             .select([uq(pl.col(n)).alias(n) for n in names]))
+
+
+def parse(path, names):
+    """LazyFrame of the well-formed lines of the CSV file(s), fields unquoted, empty -> null."""
+    return _parse_lazy(pl.from_arrow(read_lines(path, NCPU)).lazy(), names)
+
+
+def parse_batched(path, names, reduce):
+    """Parse 1M-line batches in parallel and shrink each with `reduce` (LazyFrame -> LazyFrame)
+    before concatenating, so the full set of raw string columns never exists at once."""
+    from concurrent.futures import ThreadPoolExecutor
+    table = read_lines(path, NCPU)
+
+    def one(batch):
+        return reduce(_parse_lazy(pl.from_arrow(batch).lazy(), names)).collect()
+
+    with ThreadPoolExecutor(max(1, NCPU // 2)) as pool:
+        parts = list(pool.map(one, table.to_batches()))
+    del table
+    if not parts:
+        return reduce(_parse_lazy(pl.DataFrame({"line": []}, schema={"line": pl.String}).lazy(), names)).collect()
+    return pl.concat(parts, rechunk=False)
 
 
 def days_from_civil(y, m, d):
@@ -132,12 +152,25 @@ def main():
     # ---- Events: parse -> dedup (smallest ingest_ts) -> validate -> drop late.
     # ingest_ts is always valid F1 (rules.md), so the native parser is exact here (checked
     # identical to ts_ms on 20M rows) and ~8x faster.
-    raw = (parse(os.path.join(DATA, "events"),
-                 ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"])
-           .filter(pl.col("event_id").is_not_null())
-           .with_columns(pl.col("ingest_ts").str.to_datetime("%Y-%m-%dT%H:%M:%SZ", time_unit="ms", strict=False)
-                         .dt.epoch("ms").alias("ingest"))
-           .collect(engine=ENGINE))
+    # Each copy is reduced to typed columns right after parsing. ts_ms / price / type checks are
+    # pure per-row functions, so computing them before dedup does not change which copy is kept.
+    def reduce_events(lf):
+        purchase = pl.col("event_type") == "purchase"
+        return (lf.filter(pl.col("event_id").is_not_null())
+                .select("event_id", "user_id", "product_id",
+                        pl.col("ingest_ts").str.to_datetime("%Y-%m-%dT%H:%M:%SZ", time_unit="ms", strict=False)
+                        .dt.epoch("ms").alias("ingest"),
+                        ts_ms(pl.col("ts")).alias("ts"),
+                        pl.col("event_type").is_in(["view", "cart", "purchase"]).fill_null(False).alias("type_ok"),
+                        purchase.fill_null(False).alias("is_purchase"),
+                        pl.when(purchase & price_ok(pl.col("price_cents")))
+                        .then(pl.col("price_cents").str.strip_chars_start("0").cast(pl.Int64, strict=False))
+                        .alias("price")))
+
+    raw = parse_batched(os.path.join(DATA, "events"),
+                        ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],
+                        reduce_events)
+    log(f"events parsed: {raw.height}")
     # Dedup before validation: only ids seen more than once need the "smallest ingest_ts" pick
     # (copies with equal ingest_ts are identical, so keep="first" after the sort is exact).
     dup = raw.select(pl.col("event_id").is_duplicated())["event_id"]
@@ -145,18 +178,14 @@ def main():
                       raw.filter(dup).sort("ingest").unique("event_id", keep="first", maintain_order=True)])
     del raw
     ev = (kept.lazy()
-          .with_columns(ts_ms(pl.col("ts")).alias("ts"))
           .filter(pl.col("user_id").is_not_null() & pl.col("ts").is_not_null()
                   & (pl.col("ts") >= ws) & (pl.col("ts") < we)
-                  & pl.col("event_type").is_in(["view", "cart", "purchase"])
-                  & pl.col("product_id").is_not_null()
-                  & ((pl.col("event_type") != "purchase") | price_ok(pl.col("price_cents")))
+                  & pl.col("type_ok") & pl.col("product_id").is_not_null()
+                  & (~pl.col("is_purchase") | pl.col("price").is_not_null())
                   & (pl.col("ingest") - pl.col("ts") <= DAY))
-          .with_columns(pl.when(pl.col("event_type") == "purchase")
-                        .then(pl.col("price_cents").str.strip_chars_start("0").cast(pl.Int64))
-                        .alias("price"))
-          .select("user_id", "ts", "event_type", "product_id", "price"))
-    ev = person(ev).select("person", "ts", "event_type", "product_id", "price").collect(engine=ENGINE)
+          .select("user_id", "ts", "is_purchase", "product_id", "price"))
+    ev = person(ev).select("person", "ts", "is_purchase", "product_id", "price").collect(engine=ENGINE)
+    del kept
     log(f"events kept: {ev.height}")
 
     # ---- Sessionize: sort by (person, ts); a new session when the person changes or the gap > 30 min.
@@ -168,12 +197,12 @@ def main():
     sessions = (ev.group_by("sid").agg(
         pl.col("person").first(), pl.col("start").first(), pl.len().alias("n_events"),
         pl.col("price").sum().fill_null(0).alias("revenue"),
-        (pl.col("event_type") == "purchase").any().alias("has_purchase"))
+        pl.col("is_purchase").any().alias("has_purchase"))
         .with_columns(to_date(pl.col("start")).alias("day")))
     log(f"sessions: {sessions.height}")
 
     # ---- user_daily
-    top = (ev.filter(pl.col("event_type") == "purchase")
+    top = (ev.filter(pl.col("is_purchase"))
            .join(products, on="product_id", how="left")
            .with_columns(pl.col("category").fill_null("unknown"), to_date(pl.col("start")).alias("day"))
            .group_by("person", "day", "category").agg(pl.col("price").sum().alias("rev"))
@@ -186,6 +215,7 @@ def main():
         .select(pl.col("person").alias("user_id"), "day",
                 pl.col("sessions").cast(pl.Int64), pl.col("events").cast(pl.Int64),
                 pl.col("revenue_cents").cast(pl.Int64), "top_category"))
+    del ev, top  # the per-event frame is not needed past this point; free it before attribution
 
     # ---- Clicks: parse -> dedup -> validate.
     ck = (parse(os.path.join(DATA, "clicks"), ["click_id", "user_id", "campaign_id", "ts"])

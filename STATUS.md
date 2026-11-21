@@ -4,7 +4,7 @@ Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.m
 Cutoff: **Sun 2026-11-22 11:00 ET**. 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
 
 ## Phase
-**Phase 1: v1 correct, NOT yet submitted (2026-11-20 19:50).** Polars v1 passes 36/36 fixtures and matches the dev answer exactly on the host, and DuckDB and Polars agree on 20M. Blocked on: the Docker gate (OrbStack's engine hung at 19:34, see Risks) → amd64 check → create repo → submission #1.
+**Phase 1: v1 READY TO SUBMIT (2026-11-20 20:25).** Polars v1: `make check` PASSED on arm64 and amd64 (36/36 fixtures + exact dev match, even at MEM=3g). 20M output matches DuckDB exactly. Waiting on the user: create the `shopping-sessions` repo, push, submit #1.
 
 ## Shared machine (4 tracks on this Mac)
 - Message board: `~/Developer/hackathon/DISK_LEDGER.md`. **Check it regularly (user's instruction).** Our tag is `SHOPPING`. CLAIM any job that uses >2 GB disk, >4 GB RAM, or >4 cores for more than 10 min. Edit only our own rows.
@@ -38,11 +38,12 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 - DuckDB common-subexpression elimination evaluated `CAST`s outside their guarding `CASE` (E18 crash) → use `TRY_CAST`.
 
 ## Next 3 tasks
-1. Get Docker healthy (needs the user's OK to restart OrbStack; it would kill BLAST-RADIUS's containers), then run `make check` (arm64) and `make check-amd64`. Polars under amd64 emulation may need AVX; if it crashes with an illegal instruction, note it and rely on arm64 + host checks.
-2. Ask the user to create `shopping-sessions` (public), push, and approve submission #1. Log it in the table below.
-3. Start Phase 2 (Rust v2) in `rust/`, with `make fuzz REF=<polars image>` as the gate.
+1. With the user's OK: `gh repo create shopping-sessions --public --source . --push`, then submit the commit SHA on the track page. Log it below.
+2. Start Phase 2 (Rust v2) in `rust/`, with `make fuzz REF=<polars image>` as the gate. Design for low memory: no full copies of the string columns, interned u32 IDs.
+3. Bench v2 on 20M/60M, CLAIMing on the ledger for runs over 10 min.
 
 ## Risks / notes
+- **Docker memory:** the OrbStack VM (8 GB) is shared with BLAST-RADIUS (~3 GB). Running containers of ours at 7 GB likely hung the VM at 19:34 (user-approved restart at 20:06). **Keep our containers at MEM≤4g while others are running.** Polars v1 at 20M is OOM-killed at 4 GB in Docker (host peak RSS 3.9 GB; the scorer has 24 GB, so it should be fine there).
 - **OrbStack hung at ~19:34** (`docker ps` hangs; every `docker run` stuck at 0% CPU; host swap 4 GB). Logged as a WARN on the ledger, and BLAST-RADIUS was told. We stopped only our own jobs.
 - OrbStack VM: 8 CPU / 8 GB. Local 60M runs need `MEM=7g`.
 - L3: a data row equal to the header is a real link. Skip headers by position, never by value. A tab is an ordinary byte (person `A\tB`).
@@ -64,4 +65,7 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 | 11-20 19:25 | DuckDB v1 | 20M | host, loaded | 142 s | RANGE fix; matches Polars |
 | 11-20 19:15 | Polars v1 | 20M | host, loaded | 75 s | |
 | 11-20 19:32 | Polars v1 | 20M | host, load ~40 | 54 s | native ingest + duplicate-only dedup |
-| 11-20 19:10 | Polars v1 | dev 1M | Docker arm64 not run yet; host 1.9 s pipeline + ~1.7 s imports | | |
+| 11-20 20:05 | Polars v1 | dev 1M | Docker arm64 | 1.92 s | whole container |
+| 11-20 20:10 | Polars v1 | dev 1M | Docker amd64 (emulated) | 8.47 s | correctness only |
+| 11-20 20:15 | Polars v1 batched | 20M | host, load ~57 | 60 s | peak RSS 3.9 GB |
+| 11-20 20:18 | Polars v1 | 20M | Docker 4 CPU / 4 GB | OOM (exit 137) | memory limit of the shared VM, not the scorer's |
