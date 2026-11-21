@@ -32,7 +32,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const HALF_HOUR: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
-const NB: usize = 256; // buckets for both partition passes
+const NB: usize = 64; // buckets for both partition passes
 
 // ---------------------------------------------------------------- keys
 
@@ -730,34 +730,39 @@ fn main() {
         .into_par_iter()
         .map(|bi| {
             let n: usize = ev_parts.iter().map(|p| p[bi].len()).sum();
-            let mut recs: Vec<RawEv> = Vec::with_capacity(n);
-            for p in &ev_parts {
-                recs.extend_from_slice(&p[bi]);
-            }
-            // keep[i]: recs[i] is the copy with the smallest ingest_ts of its event_id
-            let mut keep = vec![true; n];
-            let mut first: FxHashMap<Key, u32> = FxHashMap::default();
-            first.reserve(n);
-            for i in 0..n {
-                match first.entry(recs[i].eid) {
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(i as u32);
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut o) => {
-                        let j = *o.get() as usize;
-                        if recs[i].ingest < recs[j].ingest {
-                            keep[j] = false;
-                            o.insert(i as u32);
-                        } else {
-                            keep[i] = false;
+            // Dedup in place over the per-chunk slices (no copy of the 64 B records):
+            // `win` maps event_id -> (ingest, part, row) of the copy kept so far; `lose`
+            // marks the copies that lost (a later or equal ingest_ts).
+            let mut lose: Vec<Vec<bool>> = ev_parts.iter().map(|p| vec![false; p[bi].len()]).collect();
+            let mut win: FxHashMap<Key, (i64, u32, u32)> = FxHashMap::default();
+            win.reserve(n);
+            for (pi, p) in ev_parts.iter().enumerate() {
+                for (ri, r) in p[bi].iter().enumerate() {
+                    match win.entry(r.eid) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((r.ingest, pi as u32, ri as u32));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            let (ing, wp, wr) = *o.get();
+                            if r.ingest < ing {
+                                lose[wp as usize][wr as usize] = true;
+                                o.insert((r.ingest, pi as u32, ri as u32));
+                            } else {
+                                lose[pi][ri] = true;
+                            }
                         }
                     }
                 }
             }
-            drop(first);
+            drop(win);
             let per = n / NB + n / NB / 4 + 8;
             let mut out: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(per)).collect();
-            for (r, _) in recs.iter().zip(keep.iter()).filter(|(_, k)| **k) {
+            for (r, _) in ev_parts
+                .iter()
+                .zip(lose.iter())
+                .flat_map(|(p, l)| p[bi].iter().zip(l.iter()))
+                .filter(|(_, l)| !**l)
+            {
                 if r.user == NONE
                     || r.ts == i64::MIN
                     || r.ts < ws
@@ -786,9 +791,12 @@ fn main() {
 
     // ---- per person bucket: sessions, credit, assists, aggregates.
     // campaign stats per (campaign, day): [sessions, purchasing, revenue, assisted]
-    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = (0..NB)
+    // Campaign stats accumulate per rayon split (about one array per thread), not per bucket.
+    type Acc = (Vec<(usize, Vec<UserRow>)>, Vec<[i64; 4]>);
+    let new_acc = || -> Acc { (Vec::new(), vec![[0i64; 4]; ncamp * nd]) };
+    let (mut results, camp): Acc = (0..NB)
         .into_par_iter()
-        .map(|pb| {
+        .fold(new_acc, |(mut rv, mut camp), pb| {
             let mut evs: Vec<Ev> = Vec::with_capacity(ev_by_person.iter().map(|p| p[pb].len()).sum());
             for p in &ev_by_person {
                 evs.extend_from_slice(&p[pb]);
@@ -801,7 +809,6 @@ fn main() {
             // starts a session (its gap is 0) whatever order the tied events come in.
             evs.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
             cks.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| key_cmp(a.cid, b.cid)));
-            let mut camp = vec![[0i64; 4]; ncamp * nd];
             let mut rows: Vec<UserRow> = Vec::new();
             let mut catrev = vec![0i64; ncat];
             let mut touched: Vec<u16> = Vec::new();
@@ -896,22 +903,24 @@ fn main() {
                 i = iend;
                 j = jend;
             }
-            (rows, camp)
+            rv.push((pb, rows));
+            (rv, camp)
         })
-        .collect();
+        .reduce(new_acc, |(mut ra, mut ca), (rb, cb)| {
+            ra.extend(rb);
+            for (t, s) in ca.iter_mut().zip(cb.iter()) {
+                for q in 0..4 {
+                    t[q] += s[q];
+                }
+            }
+            (ra, ca)
+        });
+    results.sort_unstable_by_key(|(pb, _)| *pb);
     drop(ev_by_person);
     drop(click_parts);
     log(t0, "sessions and attribution done");
 
     // ---- merge campaign stats, write outputs
-    let mut camp = vec![[0i64; 4]; ncamp * nd];
-    for (_, c) in &results {
-        for (t, s) in camp.iter_mut().zip(c.iter()) {
-            for q in 0..4 {
-                t[q] += s[q];
-            }
-        }
-    }
     std::fs::create_dir_all(out.join("user_daily")).unwrap();
     std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
     // user_daily as several Parquet files written in parallel (rules: one or more files).
@@ -922,7 +931,7 @@ fn main() {
         .map(|p| {
             let rows: Vec<UserRow> = results[(p * per_part).min(NB)..((p + 1) * per_part).min(NB)]
                 .iter()
-                .flat_map(|(r, _)| r.iter().copied())
+                .flat_map(|(_, r)| r.iter().copied())
                 .collect();
             write_user(&out.join(format!("user_daily/part-{p}.parquet")), &rows, &cat_names);
             rows.len()

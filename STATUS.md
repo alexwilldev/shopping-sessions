@@ -54,6 +54,7 @@ events parse ≈ 240 ns/line after the tokenizer (was 350). Remaining per-line c
 3. Bench v2 on 20M/60M, CLAIMing on the ledger for runs over 10 min.
 
 ## Risks / notes
+- **Memory is now the main risk/cost:** ~5 GB RSS at 20M (+1.8 GB mapped input). In the 8 GB OrbStack VM, 20M runs thrash (user CPU 20 s vs 6 s on the host), so VM timings at 20M are meaningless. 60M on the scorer would be ~15 GB + 5.4 GB input, within 24 GB but tight. Next: free records stage by stage (transpose ownership [bucket][chunk]), and smaller records.
 - **Docker memory:** the OrbStack VM (8 GB) is shared with BLAST-RADIUS (~3 GB). Running containers of ours at 7 GB likely hung the VM at 19:34 (user-approved restart at 20:06). **Keep our containers at MEM≤4g while others are running.** Polars v1 at 20M is OOM-killed at 4 GB in Docker (host peak RSS 3.9 GB; the scorer has 24 GB, so it should be fine there).
 - **OrbStack hung at ~19:34** (`docker ps` hangs; every `docker run` stuck at 0% CPU; host swap 4 GB). Logged as a WARN on the ledger, and BLAST-RADIUS was told. We stopped only our own jobs.
 - OrbStack VM: 8 CPU / 8 GB. Local 60M runs need `MEM=7g`.
@@ -73,6 +74,8 @@ events parse ≈ 240 ns/line after the tokenizer (was 350). Remaining per-line c
 | 3 | slot 21:32 | 528424a | Rust v2.1 | local gates + fuzz 30/30 passed | pending | SWAR tokenizer, fast key_of, contiguous dedup, parallel user_daily write; 20M user CPU 12.6 → 8.7 s |
 
 | 4 | next slot | v2.2 (HEAD at handover) | Rust v2.2 | all gates + fuzz 30/30 | pending | links concurrent with parsing; users resolved after dedup; Linux 5M user CPU 2.33 → 1.77 s |
+
+| 5 | next slot | v2.3 (HEAD at handover) | Rust v2.3 | all gates + fuzz 30/30 | pending | in-place dedup (no record copy), per-thread campaign arrays, NB=64; quiet host 20M 1.36–1.95 s vs v2.2 1.70–2.81 s |
 
 ## Local bench log (relative only)
 | Date | Impl | Dataset | Where | Wall time | Notes |
