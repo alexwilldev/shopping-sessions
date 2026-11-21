@@ -31,3 +31,7 @@ bench60: build
 REF ?= shopping-sessions:v1
 fuzz: build
 	scripts/fuzz.sh $(REF) $(IMAGE) 50
+
+## Reference (v1 Polars) image for fuzzing: make build-v1
+build-v1:
+	docker buildx build --platform $(PLATFORM) --load -f Dockerfile.polars -t shopping-sessions:v1 .

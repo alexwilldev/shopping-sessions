@@ -1,25 +1,18 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM python:3.12-slim-bookworm
+# Shopping Sessions v2: native Rust binary in a slim runtime image.
+# The scorers are linux/amd64 (Intel Xeon, Cascade Lake or newer, AVX-512). No platform is
+# pinned, so `make build` with PLATFORM=linux/arm64 also works for fast local loops.
+FROM rust:1-bookworm AS build
+ARG TARGETARCH
+WORKDIR /src
+COPY rust/Cargo.toml rust/Cargo.lock ./
+# Build dependencies first so code edits rebuild quickly.
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY rust/src ./src
+# x86-64-v3 (AVX2) on amd64: every scoring machine has it (they all have AVX-512).
+RUN if [ "$TARGETARCH" = "amd64" ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3"; fi; \
+    touch src/main.rs && cargo build --release && cp target/release/shopsess /shopsess
 
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ARG PIPELINE=pipeline_polars.py
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIPELINE=$PIPELINE
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+FROM debian:bookworm-slim
+COPY --from=build /shopsess /app/shopsess
+# The scorer runs as uid 1000 with a read-only root; the binary writes only to $OUTPUT_DIR.
+CMD ["/app/shopsess"]

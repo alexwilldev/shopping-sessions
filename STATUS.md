@@ -4,7 +4,10 @@ Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.m
 Cutoff: **Sun 2026-11-22 11:00 ET**. 20 scored attempts total, max 2/hour. Never submit or create/push a public repo without the user's OK.
 
 ## Phase
-**Phase 1: v1 READY TO SUBMIT (2026-11-20 20:25).** Polars v1: `make check` PASSED on arm64 and amd64 (36/36 fixtures + exact dev match, even at MEM=3g). 20M output matches DuckDB exactly. Repo **https://github.com/alexwilldev/shopping-sessions** (public, `main`) pushed 2026-11-20. **The user submits #1 themselves** (commit `9b66a084e46543bdf4efae2ad5910b8dbd7682df`). Ask the user for the result and log it below.
+**Phase 2: Rust v2 READY (2026-11-20 20:55).** `rust/` (binary `shopsess`), root `Dockerfile` now builds it (`Dockerfile.polars` = v1). Gates: host 36/36 fixtures + exact dev match; Docker arm64 + amd64 `check.sh` PASSED; fuzz 30/30 seeds identical to v1; 20M output identical to v1/DuckDB. Host 20M: **4.5 s** (v1: 54 s); dev 0.29 s; peak RSS 5.4 GB. Docker 20M on the Mac: 11–14 s (dominated by OrbStack's /data file sharing, so use host timings).
+v1 practice result: **37.48 s, rank 68; leader 0.93 s** → v2 must get to ~1 s.
+
+Older: **Phase 1: v1 READY TO SUBMIT (2026-11-20 20:25).** Polars v1: `make check` PASSED on arm64 and amd64 (36/36 fixtures + exact dev match, even at MEM=3g). 20M output matches DuckDB exactly. Repo **https://github.com/alexwilldev/shopping-sessions** (public, `main`) pushed 2026-11-20. **The user submits #1 themselves** (commit `9b66a084e46543bdf4efae2ad5910b8dbd7682df`). Ask the user for the result and log it below.
 
 ## Shared machine (4 tracks on this Mac)
 - Message board: `~/Developer/hackathon/DISK_LEDGER.md`. **Check it regularly (user's instruction).** Our tag is `SHOPPING`. CLAIM any job that uses >2 GB disk, >4 GB RAM, or >4 cores for more than 10 min. Edit only our own rows.
@@ -37,7 +40,12 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 - **Equal timestamps (rules.md Events 5):** DuckDB's `lag()` and its running `sum() ROWS` frame ordered tied rows differently, so a tied event got the previous session's number. 20M showed 4 user rows and 2 campaign rows wrong, while the fixtures and dev passed. Fixed with a RANGE frame. In Rust: sort by (person, ts) once and decide new sessions from the previous row in that one order.
 - DuckDB common-subexpression elimination evaluated `CAST`s outside their guarding `CASE` (E18 crash) → use `TRY_CAST`.
 
-## Next 3 tasks
+## Next 3 tasks (Phase 3: optimize v2)
+1. Profile v2 stages on 20M on the host: events parse is ~2 s of 4.5 s. Targets: SIMD/memchr line + comma scan, avoid the 64 B RawEv (dedup with a compact table), pre-size bucket vecs, fewer than 256 buckets × chunks Vecs, faster hash (FxHash on u128).
+2. Cut memory (5.4 GB at 20M → ~16 GB at 60M is risky): smaller records, free stage outputs early.
+3. Each candidate: fixtures + dev + fuzz (`MEM=3g CPUS=4 scripts/fuzz.sh shopping-sessions:v1 shopping-sessions:latest 30`), then submit if the host gain is >10%.
+
+## Older next tasks
 1. Get submission #1's result from the user (dev check + practice time) and log it below. Keep every submitted commit in the public repo.
 2. Start Phase 2 (Rust v2) in `rust/`, with `make fuzz REF=<polars image>` as the gate. Design for low memory: no full copies of the string columns, interned u32 IDs.
 3. Bench v2 on 20M/60M, CLAIMing on the ledger for runs over 10 min.
@@ -57,7 +65,8 @@ Decision: **Polars for v1.** The custom Rust v2 is still planned (PLAN.md Phase 
 ## Submission log
 | # | Time (ET) | Commit | Impl | Dev check | Practice time | Notes |
 |---|---|---|---|---|---|---|
-| 1 | 11-20 ~20:30 (user submitting) | 9b66a08 | Polars v1 | local gate passed | pending | first correct version; ties go to earliest |
+| 1 | 11-20 ~20:30 | 9b66a08 | Polars v1 | passed | **37.48 s** (rank 68; 83 ms wait) | leader 0.93 s |
+| 2 | (pending) | see git log | Rust v2 | local gates passed | pending | host 20M 4.5 s |
 
 ## Local bench log (relative only)
 | Date | Impl | Dataset | Where | Wall time | Notes |

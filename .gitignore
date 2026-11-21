@@ -8,3 +8,4 @@ out/
 target/
 .DS_Store
 __pycache__/
+rust/target/
