@@ -938,12 +938,15 @@ fn main() {
             let mut catrev = vec![0i64; ncat];
             let mut touched: Vec<u16> = Vec::new();
             let mut starts: Vec<i64> = Vec::new();
+            let mut sdays: Vec<u32> = Vec::new(); // day index of each session start
+            let mut dend: Vec<u32> = Vec::new(); // first later-day session after each session
             let mut ccamp: Vec<(u16, i64)> = Vec::new();
             for p in 0..np_ {
                 let person = persons[p];
                 let (i, iend) = (eoff[p] as usize, eoff[p + 1] as usize);
                 let pc = &cks[coff[p] as usize..coff[p + 1] as usize];
                 starts.clear();
+                sdays.clear();
                 let mut row = UserRow { person, day: i32::MIN, sessions: 0, events: 0, revenue: 0, top: None };
                 let mut cp = 0usize; // clicks with ts <= current start are pc[..cp]
                 let mut grp = 0usize; // first click of the latest-ts group in pc[..cp]
@@ -955,6 +958,7 @@ fn main() {
                         row.events += n;
                         row.revenue += rev;
                         starts.push(start);
+                        sdays.push((sday - day0) as u32);
                         // credit: latest click at or before the start; ties -> smallest click_id
                         while cp < pc.len() && pc[cp].ts <= start {
                             if cp == 0 || pc[cp].ts != pc[cp - 1].ts {
@@ -1020,6 +1024,11 @@ fn main() {
                     ccamp.clear();
                     ccamp.extend(pc.iter().map(|c| (c.camp, c.ts)));
                     ccamp.sort_unstable();
+                    dend.clear();
+                    dend.resize(starts.len(), 0);
+                    for i in (0..starts.len()).rev() {
+                        dend[i] = if i + 1 < starts.len() && sdays[i + 1] == sdays[i] { dend[i + 1] } else { (i + 1) as u32 };
+                    }
                     let mut a = 0;
                     while a < ccamp.len() {
                         let cid = ccamp[a].0;
@@ -1031,10 +1040,13 @@ fn main() {
                             b += 1;
                         }
                         let hi = hi + WEEK;
+                        // one add per (interval, day), not per session
                         let mut s = starts.partition_point(|&x| x < lo);
-                        while s < starts.len() && starts[s] <= hi {
-                            camp[cid as usize * nd + (starts[s].div_euclid(DAY) - day0) as usize][3] += 1;
-                            s += 1;
+                        let e = starts.partition_point(|&x| x <= hi);
+                        while s < e {
+                            let n = (dend[s] as usize).min(e);
+                            camp[cid as usize * nd + sdays[s] as usize][3] += (n - s) as i64;
+                            s = n;
                         }
                         a = b;
                     }
