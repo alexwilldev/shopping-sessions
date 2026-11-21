@@ -1,0 +1,10 @@
+data/
+ref/
+source files/
+logs/
+bin/
+out/
+.venv/
+target/
+.DS_Store
+__pycache__/

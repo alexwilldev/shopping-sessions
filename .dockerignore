@@ -1,0 +1,11 @@
+data/
+ref/
+source files/
+logs/
+bin/
+out/
+.venv/
+target/
+fixtures/
+.git
+*.md
