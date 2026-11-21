@@ -65,20 +65,12 @@ struct Dense {
     miss: u16,
 }
 
-#[inline]
+#[inline(always)]
 fn canon_num(b: &[u8]) -> Option<usize> {
-    if b.is_empty() || b.len() > 7 || (b[0] == b'0' && b.len() > 1) {
+    if b.len() > 7 || (b.len() > 1 && b[0] == b'0') {
         return None;
     }
-    let mut n = 0usize;
-    for &c in b {
-        let d = c.wrapping_sub(b'0');
-        if d > 9 {
-            return None;
-        }
-        n = n * 10 + d as usize;
-    }
-    Some(n)
+    ts::digits8(b).map(|v| v as usize)
 }
 
 impl Dense {
@@ -115,7 +107,13 @@ impl Dense {
         match &self.map {
             None => {
                 let pl = self.prefix.len();
-                if b.len() > pl && b[..pl] == self.prefix[..] {
+                let pre_ok = match pl {
+                    0 => true,
+                    1 => b.len() > 1 && b[0] == self.prefix[0],
+                    2 => b.len() > 2 && b[0] == self.prefix[0] && b[1] == self.prefix[1],
+                    _ => b.len() > pl && b[..pl] == self.prefix[..],
+                };
+                if pre_ok && b.len() > pl {
                     if let Some(n) = canon_num(&b[pl..]) {
                         if n < self.arr.len() {
                             return self.arr[n];
@@ -198,10 +196,31 @@ impl LinkTable {
 
 use ts::parse_ts;
 
+/// 1 view, 2 cart, 3 purchase, 0 anything else (exact, case-sensitive); word compares.
+#[inline(always)]
+fn event_type(b: &[u8]) -> u8 {
+    if b.len() == 4 {
+        let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        ((w == u32::from_le_bytes(*b"view")) as u8) | (((w == u32::from_le_bytes(*b"cart")) as u8) << 1)
+    } else if b.len() == 8 {
+        let w = u64::from_le_bytes(b.try_into().unwrap());
+        3 * (w == u64::from_le_bytes(*b"purchase")) as u8
+    } else {
+        0
+    }
+}
+
 /// Purchase price: ASCII digits only, value 1..=10,000,000. None = bad.
 #[inline]
 fn parse_price(b: &[u8]) -> Option<i32> {
-    if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
+    if b.len() <= 8 {
+        return match ts::digits8(b) {
+            Some(v) if v <= 10_000_000 => Some(v as i32),
+            _ => None,
+        };
+    }
+    // long: leading zeros allowed ("0000000250" is 250)
+    if !b.iter().all(u8::is_ascii_digit) {
         return None;
     }
     let mut i = 0;
@@ -210,12 +229,9 @@ fn parse_price(b: &[u8]) -> Option<i32> {
     }
     let s = &b[i..];
     if s.is_empty() || s.len() > 8 {
-        return None;
+        return if s.is_empty() { Some(0) } else { None };
     }
-    let mut v: i64 = 0;
-    for &c in s {
-        v = v * 10 + (c - b'0') as i64;
-    }
+    let v = ts::digits8(s)?;
     if v <= 10_000_000 { Some(v as i32) } else { None }
 }
 
@@ -688,12 +704,7 @@ fn main() {
                                 let user = key_of(f[1]);
                                 let ts = parse_ts(f[2]);
                                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                                let etype = match f[4] {
-                                    b"view" => 1,
-                                    b"cart" => 2,
-                                    b"purchase" => 3,
-                                    _ => 0,
-                                };
+                                let etype = event_type(f[4]);
                                 let mut price = 0u32;
                                 let mut ok = user != NONE && etype != 0 && !f[5].is_empty();
                                 if etype == 3 {

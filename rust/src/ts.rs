@@ -56,6 +56,32 @@ fn day_table() -> &'static [i32] {
 
 const DIM: [u8; 16] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0];
 
+/// Value of 1..=8 ASCII digits; None if empty, longer than 8, or any non-digit.
+/// Reads 8 bytes from b's start when that stays inside b's page (as it does inside a mapped
+/// file), so no per-byte loop.
+#[inline(always)]
+pub fn digits8(b: &[u8]) -> Option<u64> {
+    let k = b.len();
+    if k == 0 || k > 8 {
+        return None;
+    }
+    let p = b.as_ptr();
+    let raw = if (p as usize & 4095) <= 4096 - 8 {
+        u64::from_le(unsafe { std::ptr::read_unaligned(p as *const u64) })
+    } else {
+        let mut buf = [0u8; 8];
+        buf[..k].copy_from_slice(b);
+        u64::from_le_bytes(buf)
+    };
+    let sh = 8 * (8 - k) as u32;
+    // keep the k bytes, moved to the top; '0' bytes below them
+    let x = (raw << sh) ^ (0x3030_3030_3030_3030u64 << sh);
+    if (not_digit(x) | (x & 0x8080_8080_8080_8080)) != 0 {
+        return None;
+    }
+    Some(parse8(x))
+}
+
 /// F1 / F2 (b.len() is 20 or 25).
 #[inline(always)]
 fn f12(b: &[u8]) -> Option<i64> {
@@ -241,6 +267,27 @@ pub mod tests {
             off = sign * (oh * 60 + om);
         }
         Some((super::days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s) * 1000 - off * 60_000)
+    }
+
+    #[test]
+    fn digits8_matches_reference() {
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let alphabet = b"0123456789x/: ";
+        for _ in 0..200_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let l = (s % 11) as usize;
+            let v: Vec<u8> = (0..l).map(|j| alphabet[((s >> (8 + 5 * j)) as usize) % if (s >> 60) < 12 { 10 } else { alphabet.len() }]).collect();
+            let r = if !v.is_empty() && v.len() <= 8 && v.iter().all(u8::is_ascii_digit) {
+                Some(v.iter().fold(0u64, |a, &c| a * 10 + (c - b'0') as u64))
+            } else {
+                None
+            };
+            let mut buf = v.clone();
+            buf.extend_from_slice(b"99999999");
+            assert_eq!(super::digits8(&buf[..v.len()]), r, "{:?}", String::from_utf8_lossy(&v));
+        }
     }
 
     #[test]
