@@ -22,3 +22,6 @@ CMD ["/app/shopsess"]
 # Scored best on the scorer (1.489 s vs 1.574 s for the same code without): no huge pages,
 # no up-front populate, 1 MB chunks.
 ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_LARGE_OS_PAGES=0 SS_POPULATE=0 SS_CHUNK_KB=1024
+
+# A/B variant.
+ENV SS_QEV=48000 SS_THREADS=16
