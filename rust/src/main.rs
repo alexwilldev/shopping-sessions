@@ -29,13 +29,25 @@ use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AO};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const HALF_HOUR: i64 = 1_800_000;
-const CHUNK: usize = 4 << 20;
+/// Tuning knobs, read once from the environment (defaults = the tuned values). They change
+/// speed only, never results: SS_CHUNK_KB (parse chunk size), SS_POPULATE (0 = no
+/// MADV_POPULATE_READ), SS_PROBE (measurement builds only: after writing, sleep 9x the time
+/// up to phase N: 1 links, 2 parse, 3 dedup, 4 sessions, 5 total).
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+static CHUNK_SZ: OnceLock<usize> = OnceLock::new();
+static POPULATE: OnceLock<bool> = OnceLock::new();
+fn chunk_size() -> usize {
+    *CHUNK_SZ.get_or_init(|| knob("SS_CHUNK_KB", 4096).clamp(64, 1 << 20) << 10)
+}
 
 #[inline(always)]
 fn prefetch<T>(p: *const T) {
@@ -278,7 +290,7 @@ fn chunks(paths: &[PathBuf]) -> Vec<Chunk> {
         };
         let mut s = first;
         while s < map.len() {
-            let mut e = (s + CHUNK).min(map.len());
+            let mut e = (s + chunk_size()).min(map.len());
             if e < map.len() {
                 e = match map[e..].iter().position(|&c| c == b'\n') {
                     Some(i) => e + i + 1,
@@ -371,6 +383,9 @@ struct UserRow {
 /// Pre-faults a chunk of a mapped input file in one call (Linux 5.14+; ignored elsewhere).
 #[inline]
 fn populate(c: &Chunk) {
+    if !*POPULATE.get_or_init(|| knob("SS_POPULATE", 1) != 0) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     unsafe {
         let base = c.map.as_ptr() as usize;
@@ -689,6 +704,7 @@ fn main() {
     let nids = ids.iter().filter(|&&k| k != NONE).count();
     let links = LinkTable::new(&entries);
     log(t0, &format!("links: {} ids, {} non-name", nids, entries.len()));
+    let t_links = t0.elapsed();
     drop(entries);
     drop(parent);
     drop(ids);
@@ -837,6 +853,7 @@ fn main() {
         cp_all.push(c);
     }
     log(t0, &format!("events and clicks parsed ({} dedup / {} person partitions)", nq, np));
+    let t_parse = t0.elapsed();
 
     // ---- dedup: per event_id partition, smallest ingest_ts wins; losers marked DEAD in place
     {
@@ -883,6 +900,7 @@ fn main() {
     }
     drop(dp_all);
     log(t0, "events deduped");
+    let t_dedup = t0.elapsed();
 
     // ---- per person partition: sessions, credit, assists, aggregates.
     // campaign stats per (campaign, day): [sessions, purchasing, revenue, assisted]
@@ -1123,6 +1141,7 @@ fn main() {
         });
     results.sort_unstable_by_key(|(pb, _)| *pb);
     log(t0, "sessions and attribution done");
+    let t_sess = t0.elapsed();
 
     // ---- write outputs
     std::fs::create_dir_all(out.join("user_daily")).unwrap();
@@ -1164,6 +1183,14 @@ fn main() {
     write_campaign(&out.join("campaign_daily/part-0.parquet"), &cids, &chans, &days, &vals);
     log(t0, &format!("done: {} user rows, {} campaign rows", n_user, days.len()));
     // Fast exit: the files are written (write(2) returned); skip freeing everything.
+    match knob("SS_PROBE", 0) {
+        0 => {}
+        1 => std::thread::sleep(t_links * 9),
+        2 => std::thread::sleep(t_parse * 9),
+        3 => std::thread::sleep(t_dedup * 9),
+        4 => std::thread::sleep(t_sess * 9),
+        _ => std::thread::sleep(t0.elapsed() * 9),
+    }
     unsafe { libc::_exit(0) }
 }
 
