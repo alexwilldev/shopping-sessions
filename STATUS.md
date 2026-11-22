@@ -1,3 +1,11 @@
+## SUNDAY QUEUE (v5 data; all gated: fixtures, dev answer, 20M vs v2.4 oracle, 40-seed fuzz, amd64)
+Repo https://github.com/alexwilldev/shopping-sessions
+1. main a1483cd937ed0903e37c67228cb013a8d02b6173 (v3.7 + combo env; same code as 79a83a5 plus default-off knobs)
+2. var-qev48 59488a7aeee342847dd4fb70db9353d94e6fdb5e (4x larger dedup partitions)
+3. var-th16 754de8353a1bbcc4204acd0f9e9e032bc78dfd7a (16 worker threads via SS_THREADS)
+Scores so far (v3.6 code): combo 1.4887 best, nopop 1.5288, nohuge 1.5710, main 1.5735, chunk1m 1.5887.
+Leaders (~0.42-0.46 s) invert the per-seed ID bijection (e.g. voiper-asterisk keyrec.rs), which rules.md forbids.
+
 # STATUS: Shopping Sessions (resume from this file)
 
 Read first: `source files/rules.md` (the spec, wins over everything) and `PLAN.md` (strategy, phases, budget).
