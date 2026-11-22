@@ -16,6 +16,18 @@ Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse b
 - Single-thread parse CPU on M1: 4.1 s -> 2.8 s; dedup phase 1.4 -> 0.27 CPU-s; sys 2.1 -> 0.7 s.
 - Next: 30-min bins for sessions; link lookups (0.55 s/thread on M1, TLB-bound on 16 KB pages; should be better under THP on the scorer).
 
+## MORNING QUEUE (Sun 22 Nov; cutoff 11:00 ET). Repo: https://github.com/alexwilldev/shopping-sessions
+0. FIRST (user): put the NEW generator.zip, dev-answer.zip, rules.md (v5, Sat 21:08 rescore) into `source files/`. Then Claude: rebuild bin/generate, regenerate data/dev + ref/dev-answer + gen20m, re-run all gates on v5 before anything else is submitted.
+1. main d6d909903e3f5d8043bc1f571fa8d4bf4d6ba60b (v3.5 = v3.4 lock-free long IDs + hashed long event IDs + knobs, defaults unchanged). Best candidate. Gated on v4 fixtures/dev/20M, x86 (Rosetta) tests, long-ID copy; NOT yet on v5 data/dev answer.
+2. A/B variants of #1 (identical results; only an ENV line differs). Submit after #1 scores; keep whichever is faster:
+   - var-t12 9fb9f38270761ddcaab73c535cb82d98eedcf05d (NCPU=12)
+   - var-t16 9bce4b10ed935cef713c8e836e9bef917aab62ba (NCPU=16)
+   - var-t4 6dd56b278cd5991dc875278ce5bd2fa2d44be6a9 (NCPU=4)
+   - var-nopop d68f2163b45d9bccef3abf150825d17d5c7aabe7 (no MADV_POPULATE_READ)
+   - var-chunk1m dec20cf851017b8680c5b0a65823deb3d393550a (1 MB parse chunks)
+   - var-nohuge efe7b0dfdd22a856046619080bd89f8239b10a6a (mimalloc large pages off)
+3. Probes (never final; slow on purpose; score = F + T + 9*phase): var-probe-parse 5130804e8f5bce01154cf61a9792d357f4444313 (parse incl. links), var-probe-sess 5b6c44e95ce41b17fa2fcd5e6578fe819f39a46f (through sessions). With v3.3: F ~0.14 s, T ~1.26 s (probe be30b75 scored 12.74 s).
+
 ## RULES CHANGE (Sat 21:08): generator v5 = per-seed keyed bijection IDs + 1-in-8 32-char hex suffixes; all best entries rescored on v5; finals = top 30, 3 fresh 60M datasets, 9 runs. Quota now rolling 1 h per submission (5/h per chat). Private repos allowed (user's call).
 - NEED from user: re-download generator.zip, dev-answer.zip, rules.md into `source files/`, then rebuild bin/generate, regenerate data/gen20m, gen60m, dev + ref/dev-answer, re-run all gates.
 - v3.4: long IDs (>10 bytes or odd chars) go through a lock-free chained intern table (keys.rs; bytes copied once to per-thread arenas; no mutex) and link names use a parallel CAS-min when long IDs exist. On a 5M copy with 1-in-8 IDs + 32 hex chars (data/gen5m_long): matches v2.4; 2 threads 1.47 s (v3.2, mutex) -> 0.60 s. Long IDs still cost ~+50% CPU (intern per occurrence; event IDs are unique: next idea = hash-only event IDs with byte verification in dedup).
