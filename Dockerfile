@@ -18,3 +18,6 @@ COPY --from=build /shopsess /app/shopsess
 ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1 MIMALLOC_LARGE_OS_PAGES=1
 # The scorer runs as uid 1000 with a read-only root; the binary writes only to $OUTPUT_DIR.
 CMD ["/app/shopsess"]
+
+# A/B variant t12 (speed only; results identical)
+ENV NCPU=12
