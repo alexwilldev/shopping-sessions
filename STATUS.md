@@ -17,7 +17,7 @@ Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse b
 - Next: 30-min bins for sessions; link lookups (0.55 s/thread on M1, TLB-bound on 16 KB pages; should be better under THP on the scorer).
 
 ## MORNING QUEUE (Sun 22 Nov; cutoff 11:00 ET). Repo: https://github.com/alexwilldev/shopping-sessions
-0. FIRST (user): put the NEW generator.zip, dev-answer.zip, rules.md (v5, Sat 21:08 rescore) into `source files/`. Then Claude: rebuild bin/generate, regenerate data/dev + ref/dev-answer + gen20m, re-run all gates on v5 before anything else is submitted.
+0. FIRST (user): put the NEW generator.zip, dev-answer.zip, rules.md (v5, Sat 21:08 rescore) into `source files/`. Then Claude runs `scripts/v5_setup.sh bin/oracle_v24` (builds the new generator, regenerates dev/gen5m/gen20m, unpacks the new dev answer, native gate, 20M diff vs the v2.4 oracle binary kept in bin/oracle_v24), then `make check-amd64`, then fuzz; re-read the new rules.md for rule changes. Only then submit.
 1. main e3a33239a63fd88278eab7c46596e303a3ed511c (v3.6). Best candidate. v3.4 lock-free long IDs + v3.5 hashed long event IDs + knobs + v3.6 opaque-ID product/campaign table (no number decoding: the rules now say IDs are opaque strings). Gated on old fixtures/dev/20M, x86 (Rosetta) tests, long-ID copies; NOT yet on v5 data/dev answer. (Board Sat 23:35: our entry 5.22 s = v3.3 rescored on v5, slowed by the old mutex on long IDs; v3.4+ fixes that.)
 2. A/B variants of #1 (identical results; only an ENV line differs). Submit after #1 scores; keep whichever is faster:
    - var-t12 b2c6454bb684694f9994a0e8c58e54ece4cbe156 (NCPU=12)
