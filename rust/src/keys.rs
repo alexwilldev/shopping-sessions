@@ -254,6 +254,19 @@ pub fn key_of(b: &[u8]) -> Key {
         return NONE;
     }
     if l <= 10 {
+        let k = key_of_short(b);
+        if k != NONE {
+            return k;
+        }
+    }
+    long_key(b)
+}
+
+/// Packed key of a 1..=10-byte ID, or NONE when it is not packable.
+#[inline(always)]
+fn key_of_short(b: &[u8]) -> Key {
+    let l = b.len();
+    {
         let p = b.as_ptr();
         if (p as usize & 4095) <= 4096 - 16 {
             // 16 bytes from p stay inside p's page
@@ -268,7 +281,7 @@ pub fn key_of(b: &[u8]) -> Key {
             }
         }
     }
-    long_key(b)
+    NONE
 }
 
 #[inline(never)]
@@ -299,6 +312,38 @@ fn long_key(b: &[u8]) -> Key {
             Err(now) => first = now, // new nodes in front: check them, then retry
         }
     }
+}
+
+/// Event IDs need only equality (they are never output or ordered). A packable one gets its
+/// packed key and src 0; any other gets a 64-bit hash key tagged 0xE in the low nibble (never a
+/// packed or interned key) plus `src` = its location (ptr << 16 | len) in the mapped input,
+/// which stays valid for the whole run: equal hash keys are confirmed by comparing bytes.
+#[inline]
+pub fn eid_key(b: &'static [u8]) -> (Key, u64) {
+    let l = b.len();
+    if l <= 10 {
+        let k = key_of_short(b);
+        if k != NONE {
+            return (k, 0);
+        }
+    }
+    if l >= 1 << 16 {
+        return (key_of(b), 0); // absurdly long: intern
+    }
+    ((hash_bytes(b) & !0xF) | 0xE, ((b.as_ptr() as u64) << 16) | l as u64)
+}
+
+/// Same ID behind two `eid_key` results with equal keys.
+#[inline]
+pub fn same_eid(k: Key, src_a: u64, src_b: u64) -> bool {
+    if k & 0xF != 0xE {
+        return true;
+    }
+    let (la, lb) = ((src_a & 0xFFFF) as usize, (src_b & 0xFFFF) as usize);
+    la == lb
+        && unsafe {
+            std::slice::from_raw_parts((src_a >> 16) as *const u8, la) == std::slice::from_raw_parts((src_b >> 16) as *const u8, lb)
+        }
 }
 
 /// The bytes of a long key.

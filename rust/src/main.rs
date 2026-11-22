@@ -294,7 +294,7 @@ fn chunks(paths: &[PathBuf]) -> Vec<Chunk> {
 
 /// Every well-formed line of a chunk, as N unquoted fields (see scan.rs).
 #[inline(always)]
-fn for_records<const N: usize>(c: &Chunk, f: impl FnMut(&[&[u8]; N])) {
+fn for_records<const N: usize>(c: &Chunk, f: impl FnMut(&[&'static [u8]; N])) {
     scan::for_records::<N>(&c.map[c.start..c.end], f)
 }
 
@@ -327,6 +327,7 @@ struct E {
 struct D {
     eid: Key,
     loc: u64,
+    src: u64, // see keys::eid_key: where a hashed (long) event ID's bytes are
 }
 
 /// One valid click, in the person partition of its user.
@@ -729,23 +730,23 @@ fn main() {
                         if i < ev_chunks.len() {
                             let c = &ev_chunks[i];
                             populate(c);
-                            let mut ring: [(Key, Key, E); RING] =
-                                [(NONE, NONE, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }); RING];
+                            let mut ring: [(Key, Key, u64, E); RING] =
+                                [(NONE, NONE, 0, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }); RING];
                             let mut n = 0usize;
-                            let emit = |(user, eid, mut e): (Key, Key, E), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
+                            let emit = |(user, eid, src, mut e): (Key, Key, u64, E), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
                                 let person = links.resolve(user);
                                 e.person = person;
                                 let pp = part(person, pbits);
                                 let v = &mut ep[pp];
                                 let idx = v.len();
                                 v.push(e);
-                                dp[part(eid, qbits)].push(D { eid, loc: ((t as u64) << 48) | ((pp as u64) << 32) | idx as u64 });
+                                dp[part(eid, qbits)].push(D { eid, loc: ((t as u64) << 48) | ((pp as u64) << 32) | idx as u64, src });
                             };
                             for_records::<7>(c, |f| {
                                 if f[0].is_empty() {
                                     return;
                                 }
-                                let eid = key_of(f[0]);
+                                let (eid, src) = keys::eid_key(f[0]);
                                 let user = key_of(f[1]);
                                 let ts = parse_ts(f[2]);
                                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
@@ -780,7 +781,7 @@ fn main() {
                                 if n >= RING {
                                     emit(*slot, &mut ep, &mut dp);
                                 }
-                                *slot = (user, eid, e);
+                                *slot = (user, eid, src, e);
                                 n += 1;
                             });
                             for j in n.saturating_sub(RING)..n {
@@ -852,7 +853,7 @@ fn main() {
             let cap = (n + n / 2).next_power_of_two().max(16);
             let mask = cap - 1;
             tab.clear();
-            tab.resize(cap, D { eid: NONE, loc: 0 });
+            tab.resize(cap, D { eid: NONE, loc: 0, src: 0 });
             for t in dp_ref {
                 for d in &t[q] {
                     let mut i = (mix(d.eid) >> 8) as usize & mask;
@@ -862,7 +863,7 @@ fn main() {
                             *s = *d;
                             break;
                         }
-                        if s.eid == d.eid {
+                        if s.eid == d.eid && keys::same_eid(d.eid, s.src, d.src) {
                             let (a, b) = (rec(s.loc), rec(d.loc));
                             unsafe {
                                 if (*b).ingest < (*a).ingest {
