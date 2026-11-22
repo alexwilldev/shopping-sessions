@@ -3,21 +3,120 @@
 //! An ID of 1..=10 bytes from [0-9A-Z_a-z] is packed: each byte becomes a 6-bit code
 //! ('0'-'9' -> 1-10, 'A'-'Z' -> 11-36, '_' -> 37, 'a'-'z' -> 38-63; 0 pads), first byte in
 //! the top bits, so u64 order is byte-wise ID order (a prefix sorts first). The low 4 bits are
-//! 0. Any other ID is interned in a global table: low 4 bits 0xF, the index above them; those
-//! compare through their bytes (`key_cmp`). The empty ID is 0 (`NONE`).
+//! 0. Any other ID is interned in a global lock-free table: low 4 bits 0xF, the node index
+//! (+1) above them; those compare through their bytes (`key_cmp`). The empty ID is 0 (`NONE`).
 
-use rustc_hash::FxHashMap;
+use std::cell::Cell;
 use std::cmp::Ordering;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering as AO};
 
 pub type Key = u64;
 pub const NONE: Key = 0;
 
-type LongTable = Mutex<(FxHashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>;
-static LONG: OnceLock<LongTable> = OnceLock::new();
+// ---------------------------------------------------------------- long-ID table
+//
+// Chained hash table: bucket heads are atomic node indexes (+1, 0 = empty); nodes live in
+// segments allocated on demand and never move; a node's bytes are copied once into a
+// per-thread arena that is never freed. Insert = walk the chain, else CAS a new head.
 
-fn long_table() -> &'static LongTable {
-    LONG.get_or_init(|| Mutex::new((FxHashMap::default(), Vec::new())))
+#[derive(Clone, Copy)]
+struct Node {
+    hash: u64,
+    ptr: *const u8,
+    len: u32,
+    next: u32, // node index + 1, 0 = end
+}
+
+const SEG_BITS: usize = 18;
+const SEG: usize = 1 << SEG_BITS;
+const NSEG: usize = 1 << 14; // up to 2^32 nodes
+static SEGS: [AtomicPtr<Node>; NSEG] = [const { AtomicPtr::new(std::ptr::null_mut()) }; NSEG];
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+static BUCKETS: OnceLock<Box<[AtomicU32]>> = OnceLock::new();
+
+/// Sizes the long-ID table for about `expected` distinct long IDs (call before any key_of).
+pub fn init_long(expected: usize) {
+    let _ = BUCKETS.set(new_buckets(expected));
+}
+
+fn new_buckets(expected: usize) -> Box<[AtomicU32]> {
+    let n = expected.next_power_of_two().clamp(1 << 12, 1 << 26);
+    (0..n).map(|_| AtomicU32::new(0)).collect()
+}
+
+fn buckets() -> &'static [AtomicU32] {
+    BUCKETS.get_or_init(|| new_buckets(1 << 16))
+}
+
+#[inline]
+fn node_ptr(idx: usize) -> *mut Node {
+    let seg = SEGS[idx >> SEG_BITS].load(AO::Acquire);
+    unsafe { seg.add(idx & (SEG - 1)) }
+}
+
+fn alloc_node() -> usize {
+    let idx = NEXT.fetch_add(1, AO::Relaxed);
+    let s = idx >> SEG_BITS;
+    assert!(s < NSEG, "too many long IDs");
+    if SEGS[s].load(AO::Acquire).is_null() {
+        let layout = std::alloc::Layout::array::<Node>(SEG).unwrap();
+        let p = unsafe { std::alloc::alloc(layout) as *mut Node };
+        if SEGS[s].compare_exchange(std::ptr::null_mut(), p, AO::AcqRel, AO::Acquire).is_err() {
+            unsafe { std::alloc::dealloc(p as *mut u8, layout) };
+        }
+    }
+    idx
+}
+
+thread_local! {
+    static ARENA: Cell<(*mut u8, usize)> = const { Cell::new((std::ptr::null_mut(), 0)) };
+}
+
+/// Copies b into this thread's never-freed arena.
+fn arena_copy(b: &[u8]) -> *const u8 {
+    ARENA.with(|a| {
+        let (mut p, mut left) = a.get();
+        if left < b.len() {
+            let sz = (1usize << 20).max(b.len());
+            p = Box::leak(vec![0u8; sz].into_boxed_slice()).as_mut_ptr();
+            left = sz;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
+        a.set((unsafe { p.add(b.len()) }, left - b.len()));
+        p
+    })
+}
+
+#[inline]
+fn hash_bytes(b: &[u8]) -> u64 {
+    const M: u64 = 0xff51_afd7_ed55_8ccd;
+    let l = b.len();
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (l as u64).wrapping_mul(M);
+    let rd = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    if l >= 8 {
+        let mut i = 0;
+        while i + 8 <= l {
+            h = (h ^ rd(i)).wrapping_mul(M);
+            h ^= h >> 32;
+            i += 8;
+        }
+        if i < l {
+            h = (h ^ rd(l - 8)).wrapping_mul(M);
+            h ^= h >> 32;
+        }
+    } else {
+        let mut buf = [0u8; 8];
+        buf[..l].copy_from_slice(b);
+        h = (h ^ u64::from_le_bytes(buf)).wrapping_mul(M);
+        h ^= h >> 32;
+    }
+    h.wrapping_mul(0xc4ce_b9fe_1a85_ec53) ^ (h >> 29)
+}
+
+#[inline]
+fn node_bytes(n: &Node) -> &'static [u8] {
+    unsafe { std::slice::from_raw_parts(n.ptr, n.len as usize) }
 }
 
 const LO: u64 = 0x0101_0101_0101_0101;
@@ -172,16 +271,40 @@ pub fn key_of(b: &[u8]) -> Key {
     long_key(b)
 }
 
-#[cold]
+#[inline(never)]
 fn long_key(b: &[u8]) -> Key {
-    let mut t = long_table().lock().unwrap();
-    if let Some(&id) = t.0.get(b) {
-        return (id << 4) | 0xF;
+    let h = hash_bytes(b);
+    let bk = buckets();
+    let head = &bk[(h as usize) & (bk.len() - 1)];
+    let mut mine: usize = usize::MAX; // allocated node, if any
+    let mut first = head.load(AO::Acquire);
+    loop {
+        // walk the chain for an equal ID
+        let mut cur = first;
+        while cur != 0 {
+            let n = unsafe { &*node_ptr(cur as usize - 1) };
+            if n.hash == h && node_bytes(n) == b {
+                return ((cur as u64) << 4) | 0xF;
+            }
+            cur = n.next;
+        }
+        if mine == usize::MAX {
+            mine = alloc_node();
+            unsafe { *node_ptr(mine) = Node { hash: h, ptr: arena_copy(b), len: b.len() as u32, next: first } };
+        } else {
+            unsafe { (*node_ptr(mine)).next = first };
+        }
+        match head.compare_exchange(first, mine as u32 + 1, AO::AcqRel, AO::Acquire) {
+            Ok(_) => return (((mine + 1) as u64) << 4) | 0xF,
+            Err(now) => first = now, // new nodes in front: check them, then retry
+        }
     }
-    let id = t.1.len() as u64;
-    t.1.push(b.to_vec());
-    t.0.insert(b.to_vec(), id);
-    (id << 4) | 0xF
+}
+
+/// The bytes of a long key.
+#[inline]
+fn long_bytes(k: Key) -> &'static [u8] {
+    node_bytes(unsafe { &*node_ptr((k >> 4) as usize - 1) })
 }
 
 #[inline]
@@ -194,7 +317,7 @@ const DECODE: &[u8; 64] = b"\x000123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijk
 /// Appends the ID behind a key.
 pub fn push_bytes(k: Key, out: &mut Vec<u8>) {
     if is_long(k) {
-        out.extend_from_slice(&long_table().lock().unwrap().1[(k >> 4) as usize]);
+        out.extend_from_slice(long_bytes(k));
     } else {
         for i in 0..10 {
             let c = ((k >> (58 - 6 * i)) & 0x3F) as usize;
@@ -206,6 +329,7 @@ pub fn push_bytes(k: Key, out: &mut Vec<u8>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn key_bytes(k: Key) -> Vec<u8> {
     let mut v = Vec::with_capacity(10);
     push_bytes(k, &mut v);
@@ -215,7 +339,28 @@ pub fn key_bytes(k: Key) -> Vec<u8> {
 /// Byte-wise comparison of the IDs behind two keys.
 #[inline]
 pub fn key_cmp(a: Key, b: Key) -> Ordering {
-    if !is_long(a) && !is_long(b) { a.cmp(&b) } else { key_bytes(a).cmp(&key_bytes(b)) }
+    if !is_long(a) && !is_long(b) {
+        return a.cmp(&b);
+    }
+    let (mut ba, mut bb) = ([0u8; 10], [0u8; 10]);
+    short_or_long(a, &mut ba).cmp(short_or_long(b, &mut bb))
+}
+
+#[inline]
+fn short_or_long(k: Key, buf: &mut [u8; 10]) -> &[u8] {
+    if is_long(k) {
+        return long_bytes(k);
+    }
+    let mut n = 0;
+    while n < 10 {
+        let c = ((k >> (58 - 6 * n)) & 0x3F) as usize;
+        if c == 0 {
+            break;
+        }
+        buf[n] = DECODE[c];
+        n += 1;
+    }
+    &buf[..n]
 }
 
 /// Well-mixed hash of a key; partitions take the top bits, tables the middle bits.
@@ -249,6 +394,44 @@ mod tests {
         }
         Some(k << 4)
     }
+    #[test]
+    fn long_ids_concurrent() {
+        let ids: Vec<Vec<u8>> = (0..20_000u32).map(|i| format!("user_{:08}_{:032x}", i % 5000, i as u128 * 0x9e3779b97f4a7c15).into_bytes()).collect();
+        let ids = std::sync::Arc::new(ids);
+        let hs: Vec<_> = (0..8)
+            .map(|t| {
+                let ids = ids.clone();
+                std::thread::spawn(move || {
+                    let mut v = Vec::new();
+                    for j in 0..ids.len() {
+                        let i = (j * 7 + t * 2503) % ids.len();
+                        v.push((i, key_of(&ids[i])));
+                    }
+                    v
+                })
+            })
+            .collect();
+        let mut by_id: std::collections::HashMap<usize, Key> = std::collections::HashMap::new();
+        for h in hs {
+            for (i, k) in h.join().unwrap() {
+                assert!(is_long(k));
+                assert_eq!(*by_id.entry(i).or_insert(k), k, "same ID, different keys");
+            }
+        }
+        let mut seen: std::collections::HashMap<Key, &Vec<u8>> = std::collections::HashMap::new();
+        for (&i, &k) in &by_id {
+            assert_eq!(key_bytes(k), ids[i]);
+            if let Some(prev) = seen.insert(k, &ids[i]) {
+                assert_eq!(prev, &ids[i], "different IDs, same key");
+            }
+        }
+        for a in 0..300 {
+            for b in 0..300 {
+                assert_eq!(key_cmp(by_id[&a], by_id[&b]), ids[a].cmp(&ids[b]));
+            }
+        }
+    }
+
     #[test]
     fn pack_matches_reference_and_order() {
         let mut ids: Vec<Vec<u8>> = Vec::new();

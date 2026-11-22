@@ -557,6 +557,12 @@ fn main() {
 
     // ---- links: parallel parse, sorted ID list, union-find on indexes, person name = byte-wise
     // smallest ID of each component; the table keeps only IDs that are not their own name.
+    let in_bytes: u64 = ["links", "events", "clicks"]
+        .iter()
+        .flat_map(|d| csv_files(&data.join(d)))
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    keys::init_long((in_bytes / 400) as usize);
     let link_chunks = chunks(&csv_files(&data.join("links")));
     let pairs: Vec<Vec<(Key, Key)>> = link_chunks
         .par_iter()
@@ -652,23 +658,30 @@ fn main() {
             })
             .collect()
     } else {
-        let mut name: Vec<Key> = vec![NONE; cap];
-        for i in 0..cap {
-            if ids[i] == NONE {
-                continue;
+        // byte-wise min per root with a CAS loop (key_cmp reads long IDs' bytes)
+        let name: Vec<AtomicU64> = (0..cap).into_par_iter().map(|_| AtomicU64::new(NONE)).collect();
+        (0..cap).into_par_iter().for_each(|i| {
+            let k = ids[i];
+            if k == NONE {
+                return;
             }
-            let r = find(&parent, i as u32) as usize;
-            if name[r] == NONE || key_cmp(ids[i], name[r]) == Ordering::Less {
-                name[r] = ids[i];
+            let slot = &name[find(&parent, i as u32) as usize];
+            let mut cur = slot.load(AO::Relaxed);
+            while cur == NONE || key_cmp(k, cur) == Ordering::Less {
+                match slot.compare_exchange_weak(cur, k, AO::Relaxed, AO::Relaxed) {
+                    Ok(_) => break,
+                    Err(now) => cur = now,
+                }
             }
-        }
+        });
         (0..cap)
+            .into_par_iter()
             .filter_map(|i| {
                 if ids[i] == NONE {
                     return None;
                 }
-                let r = find(&parent, i as u32) as usize;
-                if ids[i] != name[r] { Some((ids[i], name[r])) } else { None }
+                let n = name[find(&parent, i as u32) as usize].load(AO::Relaxed);
+                if ids[i] != n { Some((ids[i], n)) } else { None }
             })
             .collect()
     };

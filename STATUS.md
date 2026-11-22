@@ -16,6 +16,10 @@ Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse b
 - Single-thread parse CPU on M1: 4.1 s -> 2.8 s; dedup phase 1.4 -> 0.27 CPU-s; sys 2.1 -> 0.7 s.
 - Next: 30-min bins for sessions; link lookups (0.55 s/thread on M1, TLB-bound on 16 KB pages; should be better under THP on the scorer).
 
+## RULES CHANGE (Sat 21:08): generator v5 = per-seed keyed bijection IDs + 1-in-8 32-char hex suffixes; all best entries rescored on v5; finals = top 30, 3 fresh 60M datasets, 9 runs. Quota now rolling 1 h per submission (5/h per chat). Private repos allowed (user's call).
+- NEED from user: re-download generator.zip, dev-answer.zip, rules.md into `source files/`, then rebuild bin/generate, regenerate data/gen20m, gen60m, dev + ref/dev-answer, re-run all gates.
+- v3.4: long IDs (>10 bytes or odd chars) go through a lock-free chained intern table (keys.rs; bytes copied once to per-thread arenas; no mutex) and link names use a parallel CAS-min when long IDs exist. On a 5M copy with 1-in-8 IDs + 32 hex chars (data/gen5m_long): matches v2.4; 2 threads 1.47 s (v3.2, mutex) -> 0.60 s. Long IDs still cost ~+50% CPU (intern per occurrence; event IDs are unique: next idea = hash-only event IDs with byte verification in dedup).
+
 ## Organizer guidance (via MECHROYALE, Sat ~18:20): leader 0.28 s. Final is ranked on NEW data: "don't overfit" to the generator; exact copies of others' code may be disqualified.
 Our shortcuts are all exact with a general fallback: packed keys fall back to an interned table for any ID (long, non-[0-9A-Za-z_]); `Dense` uses an array only when EVERY product/campaign ID is prefix + canonical number (< 2^22), else an exact hash map; ts table covers 1970-2099 and falls back to the calendar formula; 30-min bins use the manifest window. Keep it that way.
 
