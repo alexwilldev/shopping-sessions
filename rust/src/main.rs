@@ -68,73 +68,58 @@ fn part(k: Key, bits: u32) -> usize {
 
 // ---------------------------------------------------------------- dense ID lookups
 
-/// ID -> u16 value. When every ID is `prefix` + a canonical decimal number (e.g. `p123`), the
-/// lookup is an array index; otherwise an exact hash map.
+/// ID -> u16 value: an exact open-addressing table on the ID's key (IDs stay opaque strings;
+/// nothing is decoded from them). Keys and values in separate arrays to stay cache-dense.
 struct Dense {
-    prefix: Vec<u8>,
-    arr: Vec<u16>,
-    map: Option<FxHashMap<Vec<u8>, u16>>,
+    mask: usize,
+    keys: Vec<Key>,
+    vals: Vec<u16>,
     miss: u16,
-}
-
-#[inline(always)]
-fn canon_num(b: &[u8]) -> Option<usize> {
-    if b.len() > 7 || (b.len() > 1 && b[0] == b'0') {
-        return None;
-    }
-    ts::digits8(b).map(|v| v as usize)
 }
 
 impl Dense {
     fn new(map: FxHashMap<Vec<u8>, u16>, miss: u16) -> Dense {
-        let prefix: Vec<u8> = map
-            .keys()
-            .next()
-            .map(|b| b.iter().take_while(|c| !c.is_ascii_digit()).cloned().collect())
-            .unwrap_or_default();
-        let mut maxn = 0usize;
-        let mut dense = true;
-        for b in map.keys() {
-            match b.strip_prefix(&prefix[..]).and_then(canon_num) {
-                Some(n) => maxn = maxn.max(n),
-                None => {
-                    dense = false;
-                    break;
-                }
+        let cap = (map.len() * 2).next_power_of_two().max(16);
+        let mut d = Dense { mask: cap - 1, keys: vec![NONE; cap], vals: vec![miss; cap], miss };
+        for (b, v) in map {
+            let k = key_of(Box::leak(b.into_boxed_slice()));
+            let mut i = (mix(k) >> 16) as usize & d.mask;
+            while d.keys[i] != NONE {
+                i = (i + 1) & d.mask;
             }
+            d.keys[i] = k;
+            d.vals[i] = v;
         }
-        if dense && maxn < (1 << 22) {
-            let mut arr = vec![miss; maxn + 1];
-            for (b, &v) in &map {
-                arr[canon_num(&b[prefix.len()..]).unwrap()] = v;
-            }
-            Dense { prefix, arr, map: None, miss }
-        } else {
-            Dense { prefix, arr: Vec::new(), map: Some(map), miss }
-        }
+        d
     }
 
     #[inline]
     fn get(&self, b: &[u8]) -> u16 {
-        match &self.map {
-            None => {
-                let pl = self.prefix.len();
-                let pre_ok = match pl {
-                    0 => true,
-                    1 => b.len() > 1 && b[0] == self.prefix[0],
-                    2 => b.len() > 2 && b[0] == self.prefix[0] && b[1] == self.prefix[1],
-                    _ => b.len() > pl && b[..pl] == self.prefix[..],
-                };
-                if pre_ok && b.len() > pl {
-                    if let Some(n) = canon_num(&b[pl..]) {
-                        if n < self.arr.len() {
-                            return self.arr[n];
-                        }
-                    }
-                }
-                self.miss
+        if b.is_empty() {
+            return self.miss;
+        }
+        self.get_key(key_of(b))
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, k: Key) {
+        let i = (mix(k) >> 16) as usize & self.mask;
+        prefetch(unsafe { self.keys.as_ptr().add(i) });
+        prefetch(unsafe { self.vals.as_ptr().add(i) });
+    }
+
+    #[inline(always)]
+    fn get_key(&self, k: Key) -> u16 {
+        let mut i = (mix(k) >> 16) as usize & self.mask;
+        loop {
+            let c = unsafe { *self.keys.get_unchecked(i) };
+            if c == k {
+                return unsafe { *self.vals.get_unchecked(i) };
             }
-            Some(m) => *m.get(b).unwrap_or(&self.miss),
+            if c == NONE {
+                return self.miss;
+            }
+            i = (i + 1) & self.mask;
         }
     }
 }
@@ -568,8 +553,7 @@ fn main() {
     let organic = camp_ids.len() as u16;
     let ncamp = camp_ids.len() + 1;
     let campaigns = Dense::new(camp_map, u16::MAX);
-    log(t0, &format!("products {} categories {} campaigns {} (dense {} {})", nprod, ncat, ncamp - 1,
-        products.map.is_none(), campaigns.map.is_none()));
+    log(t0, &format!("products {} categories {} campaigns {}", nprod, ncat, ncamp - 1));
 
     // ---- links: parallel parse, sorted ID list, union-find on indexes, person name = byte-wise
     // smallest ID of each component; the table keeps only IDs that are not their own name.
@@ -746,12 +730,15 @@ fn main() {
                         if i < ev_chunks.len() {
                             let c = &ev_chunks[i];
                             populate(c);
-                            let mut ring: [(Key, Key, u64, E); RING] =
-                                [(NONE, NONE, 0, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }); RING];
+                            let mut ring: [(Key, Key, u64, Key, E); RING] =
+                                [(NONE, NONE, 0, NONE, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }); RING];
                             let mut n = 0usize;
-                            let emit = |(user, eid, src, mut e): (Key, Key, u64, E), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
+                            let emit = |(user, eid, src, pk, mut e): (Key, Key, u64, Key, E), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
                                 let person = links.resolve(user);
                                 e.person = person;
+                                if e.flags & OK != 0 {
+                                    e.cat = products.get_key(pk);
+                                }
                                 let pp = part(person, pbits);
                                 let v = &mut ep[pp];
                                 let idx = v.len();
@@ -789,15 +776,18 @@ fn main() {
                                 if ingest.saturating_sub(tsv) > DAY {
                                     ok = false;
                                 }
-                                let cat = if ok { products.get(f[5]) } else { 0 };
+                                let pk = if ok { key_of(f[5]) } else { NONE };
+                                if ok {
+                                    products.prefetch(pk);
+                                }
                                 let flags = (ok as u8) | if etype == 3 { PURCHASE } else { 0 };
                                 links.prefetch(user);
-                                let e = E { person: 0, ts: tsv, ingest, price, cat, flags };
+                                let e = E { person: 0, ts: tsv, ingest, price, cat: 0, flags };
                                 let slot = &mut ring[n % RING];
                                 if n >= RING {
                                     emit(*slot, &mut ep, &mut dp);
                                 }
-                                *slot = (user, eid, src, e);
+                                *slot = (user, eid, src, pk, e);
                                 n += 1;
                             });
                             for j in n.saturating_sub(RING)..n {
