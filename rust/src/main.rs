@@ -505,6 +505,8 @@ fn main() {
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    // SS_THREADS overrides NCPU (the scorer sets NCPU itself), for A/B runs only.
+    let ncpu = knob("SS_THREADS", ncpu).clamp(1, 256);
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
