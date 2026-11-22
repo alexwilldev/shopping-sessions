@@ -702,8 +702,8 @@ fn main() {
     let est_ev = ev_bytes / 70 + 1;
     let est_ck = ck_bytes / 45 + 1;
     let lg = |x: usize| usize::BITS - 1 - x.max(1).leading_zeros();
-    let qbits = lg(est_ev / 12_000).clamp(4, 12); // dedup partitions: ~12-24k events each
-    let pbits = lg(est_ev / 50_000).clamp(3, 10); // person partitions: ~50-100k events each
+    let qbits = lg(est_ev / knob("SS_QEV", 12_000).max(1000)).clamp(4, 12); // dedup partitions: ~QEV-2xQEV events each // dedup partitions: ~12-24k events each
+    let pbits = lg(est_ev / knob("SS_PEV", 50_000).max(1000)).clamp(3, 10); // person partitions // person partitions: ~50-100k events each
     let (nq, np) = (1usize << qbits, 1usize << pbits);
     let cmin = ws - WEEK;
     let next = AtomicUsize::new(0);
