@@ -18,15 +18,15 @@ Local 8-thread 20M wall ~0.73 s vs v3.1 ~0.77-0.80 s (noisy). Per-thread parse b
 
 ## MORNING QUEUE (Sun 22 Nov; cutoff 11:00 ET). Repo: https://github.com/alexwilldev/shopping-sessions
 0. FIRST (user): put the NEW generator.zip, dev-answer.zip, rules.md (v5, Sat 21:08 rescore) into `source files/`. Then Claude: rebuild bin/generate, regenerate data/dev + ref/dev-answer + gen20m, re-run all gates on v5 before anything else is submitted.
-1. main d6d909903e3f5d8043bc1f571fa8d4bf4d6ba60b (v3.5 = v3.4 lock-free long IDs + hashed long event IDs + knobs, defaults unchanged). Best candidate. Gated on v4 fixtures/dev/20M, x86 (Rosetta) tests, long-ID copy; NOT yet on v5 data/dev answer.
+1. main e3a33239a63fd88278eab7c46596e303a3ed511c (v3.6). Best candidate. v3.4 lock-free long IDs + v3.5 hashed long event IDs + knobs + v3.6 opaque-ID product/campaign table (no number decoding: the rules now say IDs are opaque strings). Gated on old fixtures/dev/20M, x86 (Rosetta) tests, long-ID copies; NOT yet on v5 data/dev answer. (Board Sat 23:35: our entry 5.22 s = v3.3 rescored on v5, slowed by the old mutex on long IDs; v3.4+ fixes that.)
 2. A/B variants of #1 (identical results; only an ENV line differs). Submit after #1 scores; keep whichever is faster:
-   - var-t12 9fb9f38270761ddcaab73c535cb82d98eedcf05d (NCPU=12)
-   - var-t16 9bce4b10ed935cef713c8e836e9bef917aab62ba (NCPU=16)
-   - var-t4 6dd56b278cd5991dc875278ce5bd2fa2d44be6a9 (NCPU=4)
-   - var-nopop d68f2163b45d9bccef3abf150825d17d5c7aabe7 (no MADV_POPULATE_READ)
-   - var-chunk1m dec20cf851017b8680c5b0a65823deb3d393550a (1 MB parse chunks)
-   - var-nohuge efe7b0dfdd22a856046619080bd89f8239b10a6a (mimalloc large pages off)
-3. Probes (never final; slow on purpose; score = F + T + 9*phase): var-probe-parse 5130804e8f5bce01154cf61a9792d357f4444313 (parse incl. links), var-probe-sess 5b6c44e95ce41b17fa2fcd5e6578fe819f39a46f (through sessions). With v3.3: F ~0.14 s, T ~1.26 s (probe be30b75 scored 12.74 s).
+   - var-t12 b2c6454bb684694f9994a0e8c58e54ece4cbe156 (NCPU=12)
+   - var-t16 7cf5fd2e848d6112a6c92d00613715f3a2353c04 (NCPU=16)
+   - var-t4 53c8dc70f61a81c63b63a82dc53666a713247a4f (NCPU=4)
+   - var-nopop 3a7b68ea92b532092ec159ca5c56e4a04f47db4c (no MADV_POPULATE_READ)
+   - var-chunk1m 07205c8e32934bc3d7fffb0fe28e98428a43bed9 (1 MB parse chunks)
+   - var-nohuge 821f037936d22685e66d4dff30687f8abb100882 (mimalloc large pages off)
+3. Probes (never final; slow on purpose; score = F + T + 9*phase): var-probe-parse 309f8cb0340b1be90ce597220bd1d49e210ac680 (parse incl. links), var-probe-sess c8cfc4bd9a605b36d1cf11be38f643945a3fbfa8 (through sessions). With v3.3: F ~0.14 s, T ~1.26 s (probe be30b75 scored 12.74 s).
 
 ## RULES CHANGE (Sat 21:08): generator v5 = per-seed keyed bijection IDs + 1-in-8 32-char hex suffixes; all best entries rescored on v5; finals = top 30, 3 fresh 60M datasets, 9 runs. Quota now rolling 1 h per submission (5/h per chat). Private repos allowed (user's call).
 - NEED from user: re-download generator.zip, dev-answer.zip, rules.md into `source files/`, then rebuild bin/generate, regenerate data/gen20m, gen60m, dev + ref/dev-answer, re-run all gates.
