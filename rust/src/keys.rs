@@ -264,7 +264,7 @@ pub fn key_of(b: &[u8]) -> Key {
 
 /// Packed key of a 1..=10-byte ID, or NONE when it is not packable.
 #[inline(always)]
-fn key_of_short(b: &[u8]) -> Key {
+pub fn key_of_short(b: &[u8]) -> Key {
     let l = b.len();
     {
         let p = b.as_ptr();
@@ -286,7 +286,40 @@ fn key_of_short(b: &[u8]) -> Key {
 
 #[inline(never)]
 fn long_key(b: &[u8]) -> Key {
-    let h = hash_bytes(b);
+    long_key_h(b, hash_bytes(b))
+}
+
+/// Hash of a long ID for `long_key_h` (computed early so the bucket can be prefetched).
+#[inline]
+pub fn long_hash(b: &[u8]) -> u64 {
+    hash_bytes(b)
+}
+
+#[inline]
+pub fn prefetch_long(h: u64) {
+    let bk = buckets();
+    crate::prefetch(&bk[(h as usize) & (bk.len() - 1)] as *const AtomicU32 as *const u8);
+}
+
+/// Second and third prefetch stages after `prefetch_long`: the first node of the bucket's
+/// chain, then that node's bytes. Both only read, so they are safe at any time.
+#[inline]
+pub fn prefetch_long2(h: u64, stage: u32) {
+    let bk = buckets();
+    let head = bk[(h as usize) & (bk.len() - 1)].load(AO::Acquire);
+    if head == 0 {
+        return;
+    }
+    let np = node_ptr(head as usize - 1);
+    if stage == 1 {
+        crate::prefetch(np as *const u8);
+    } else {
+        crate::prefetch(unsafe { (*np).ptr });
+    }
+}
+
+/// `key_of` for an ID that `key_of_short` rejected, with `h = long_hash(b)`.
+pub fn long_key_h(b: &[u8], h: u64) -> Key {
     let bk = buckets();
     let head = &bk[(h as usize) & (bk.len() - 1)];
     let mut mine: usize = usize::MAX; // allocated node, if any

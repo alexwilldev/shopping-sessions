@@ -50,7 +50,7 @@ fn chunk_size() -> usize {
 }
 
 #[inline(always)]
-fn prefetch<T>(p: *const T) {
+pub(crate) fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0)
@@ -332,7 +332,7 @@ struct D {
 struct C {
     person: Key,
     ts: i64,
-    cid: Key,
+    cid: &'static [u8],
     camp: u16,
 }
 
@@ -351,7 +351,7 @@ struct Ev {
 struct Click {
     person: Key,
     ts: i64,
-    cid: Key,
+    cid: &'static [u8],
     camp: u16,
 }
 
@@ -730,10 +730,12 @@ fn main() {
                         if i < ev_chunks.len() {
                             let c = &ev_chunks[i];
                             populate(c);
-                            let mut ring: [(Key, Key, u64, Key, E); RING] =
-                                [(NONE, NONE, 0, NONE, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }); RING];
+                            let mut ring: [(Key, Key, u64, Key, E, &'static [u8], u64); RING] =
+                                [(NONE, NONE, 0, NONE, E { person: 0, ts: 0, ingest: 0, price: 0, cat: 0, flags: 0 }, &[], 0); RING];
                             let mut n = 0usize;
-                            let emit = |(user, eid, src, pk, mut e): (Key, Key, u64, Key, E), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
+                            let emit = |(user, eid, src, pk, mut e, ul, uh): (Key, Key, u64, Key, E, &'static [u8], u64), ep: &mut Vec<Vec<E>>, dp: &mut Vec<Vec<D>>| {
+                                // a long user ID was hashed (and its bucket prefetched) at parse time
+                                let user = if ul.is_empty() { user } else { keys::long_key_h(ul, uh) };
                                 let person = links.resolve(user);
                                 e.person = person;
                                 if e.flags & OK != 0 {
@@ -750,12 +752,24 @@ fn main() {
                                     return;
                                 }
                                 let (eid, src) = keys::eid_key(f[0]);
-                                let user = key_of(f[1]);
+                                let ub = f[1];
+                                let (mut user, mut ul, mut uh) = (NONE, &[] as &'static [u8], 0u64);
+                                if !ub.is_empty() {
+                                    if ub.len() <= 10 {
+                                        user = keys::key_of_short(ub);
+                                    }
+                                    if user == NONE {
+                                        (ul, uh) = (ub, keys::long_hash(ub));
+                                        keys::prefetch_long(uh);
+                                    } else {
+                                        links.prefetch(user);
+                                    }
+                                }
                                 let ts = parse_ts(f[2]);
                                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
                                 let etype = event_type(f[4]);
                                 let mut price = 0u32;
-                                let mut ok = user != NONE && etype != 0 && !f[5].is_empty();
+                                let mut ok = !ub.is_empty() && etype != 0 && !f[5].is_empty();
                                 if etype == 3 {
                                     match parse_price(f[6]) {
                                         Some(p) if p >= 1 => price = p as u32,
@@ -781,13 +795,24 @@ fn main() {
                                     products.prefetch(pk);
                                 }
                                 let flags = (ok as u8) | if etype == 3 { PURCHASE } else { 0 };
-                                links.prefetch(user);
                                 let e = E { person: 0, ts: tsv, ingest, price, cat: 0, flags };
+                                if n >= 5 {
+                                    let r = &ring[(n - 5) % RING];
+                                    if !r.5.is_empty() {
+                                        keys::prefetch_long2(r.6, 1);
+                                    }
+                                }
+                                if n >= 10 {
+                                    let r = &ring[(n - 10) % RING];
+                                    if !r.5.is_empty() {
+                                        keys::prefetch_long2(r.6, 2);
+                                    }
+                                }
                                 let slot = &mut ring[n % RING];
                                 if n >= RING {
                                     emit(*slot, &mut ep, &mut dp);
                                 }
-                                *slot = (user, eid, src, pk, e);
+                                *slot = (user, eid, src, pk, e, ul, uh);
                                 n += 1;
                             });
                             for j in n.saturating_sub(RING)..n {
@@ -796,9 +821,12 @@ fn main() {
                         } else {
                             let c = &ck_chunks[i - ev_chunks.len()];
                             populate(c);
-                            let mut ring: [C; RING] = [C { person: 0, ts: 0, cid: 0, camp: 0 }; RING];
+                            let mut ring: [(C, &'static [u8], u64); RING] = [(C { person: 0, ts: 0, cid: &[], camp: 0 }, &[], 0); RING];
                             let mut n = 0usize;
-                            let emit = |mut r: C, cp: &mut Vec<Vec<C>>| {
+                            let emit = |(mut r, ul, uh): (C, &'static [u8], u64), cp: &mut Vec<Vec<C>>| {
+                                if !ul.is_empty() {
+                                    r.person = keys::long_key_h(ul, uh);
+                                }
                                 r.person = links.resolve(r.person);
                                 cp[part(r.person, pbits)].push(r);
                             };
@@ -814,13 +842,28 @@ fn main() {
                                 if ts < cmin || ts >= we {
                                     return;
                                 }
-                                let user = key_of(f[1]);
-                                links.prefetch(user);
+                                let ub = f[1];
+                                let (mut user, mut ul, mut uh) = (NONE, &[] as &'static [u8], 0u64);
+                                if ub.len() <= 10 {
+                                    user = keys::key_of_short(ub);
+                                }
+                                if user == NONE {
+                                    (ul, uh) = (ub, keys::long_hash(ub));
+                                    keys::prefetch_long(uh);
+                                } else {
+                                    links.prefetch(user);
+                                }
+                                if n >= 5 && !ring[(n - 5) % RING].1.is_empty() {
+                                    keys::prefetch_long2(ring[(n - 5) % RING].2, 1);
+                                }
+                                if n >= 10 && !ring[(n - 10) % RING].1.is_empty() {
+                                    keys::prefetch_long2(ring[(n - 10) % RING].2, 2);
+                                }
                                 let slot = &mut ring[n % RING];
                                 if n >= RING {
                                     emit(*slot, &mut cp);
                                 }
-                                *slot = C { person: user, ts, cid: key_of(f[0]), camp };
+                                *slot = (C { person: user, ts, cid: f[0], camp }, ul, uh);
                                 n += 1;
                             });
                             for j in n.saturating_sub(RING)..n {
@@ -996,7 +1039,7 @@ fn main() {
             drop(pid_of);
             for p in 0..np_ {
                 cgrouped[coff[p] as usize..coff[p + 1] as usize]
-                    .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key_cmp(a.cid, b.cid)));
+                    .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.cmp(b.cid)));
             }
             let cks = cgrouped;
             let mut rows: Vec<UserRow> = Vec::new();
