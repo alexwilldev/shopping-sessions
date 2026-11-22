@@ -1,3 +1,5 @@
+> **3 submission slots left, no renewal. See SLOTS_NOTE.md before queuing anything.**
+
 ## SUNDAY QUEUE (v5 data; all gated: fixtures, dev answer, 20M vs v2.4 oracle, 40-seed fuzz, amd64)
 Repo https://github.com/alexwilldev/shopping-sessions
 1. main a1483cd937ed0903e37c67228cb013a8d02b6173 (v3.7 + combo env; same code as 79a83a5 plus default-off knobs)
